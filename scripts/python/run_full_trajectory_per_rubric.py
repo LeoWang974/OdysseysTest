@@ -3,7 +3,7 @@
 
 Example:
     GEMINI_API_KEY=your-key python run_full_trajectory_per_rubric.py \
-        --model gemini-2.5-flash \
+        --model gemini-3.1-flash-lite-preview \
         --runs-dir path/to/runs_dir \
         --task-source-json path/to/tasks.json \
         --output path/to/eval_results_full_traj_per_rubric.json \
