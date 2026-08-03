@@ -35,17 +35,13 @@ OPENAI_API_KEY=...
 OPENAI_BASE_URL=https://tokenhub.sensetime.com/v1
 OPENAI_API_BASE=https://tokenhub.sensetime.com/v1
 OSWORLD_PATH=D:\gitWorkSpace\OSWorld
+OSWORLD_VM_PATH=C:\path\to\Ubuntu.qcow2
 ```
 
-For OSWorld, keep the VM image outside Git. The local Windows path used during
-development was:
+For OSWorld, keep the VM image outside Git. `run-osworld` reads
+`OSWORLD_VM_PATH` from `.env`; use `--path-to-vm` only when overriding it for a
+specific run.
 
-```text
-C:\zhuchangbiaozhu_xyl\桌面\Ubuntu.qcow2
-```
-
-On a Linux server, set `OSWORLD_PATH` and pass the server VM image path with
-`--path-to-vm`.
 
 ## Doctor
 
@@ -141,6 +137,16 @@ The local Windows run completed 10/10 trajectories and consumed about 1.87M
 tokens over about 2h43m. Server runs should be launched inside `tmux` or
 `screen` to avoid terminal/tool timeout.
 
+If the outer shell or Codex tool times out but OSWorld keeps running and lands
+artifacts, finalize the run from disk:
+
+```powershell
+python -m odysseys_eval finalize-run `
+  --prepared-dir outputs\dev_10 `
+  --result-dir outputs\runs_dev_10_gpt55 `
+  --report-output outputs\reports\dev_10_gpt55_runner_report.json
+```
+
 ## Runner Report
 
 If needed, regenerate a runner report from an existing run directory:
@@ -169,18 +175,22 @@ Runner report fields include:
 For OpenAI-compatible judging through tokenhub:
 
 ```powershell
-$env:ODYSSEYS_USE_CURL_OPENAI='1'
 python -m odysseys_eval score `
   --runs-dir outputs\runs_dev_10_gpt55\pyautogui\screenshot\gpt-5.5\mind2web_chrome `
   --task-source-json outputs\dev_10\selected_tasks.json `
   --output outputs\scores\dev_10_gpt55_eval.json `
+  --csv-output outputs\scores\dev_10_gpt55_eval.csv `
   --model gpt-5.5 `
   --num-workers 1 `
   --api-base https://tokenhub.sensetime.com/v1 `
   --env-file .env
 ```
 
-Summarize:
+`score` writes `outputs\scores\dev_10_gpt55_eval.manifest.json` by default and
+enables the local curl fallback automatically. Pass `--no-use-curl-openai` on a
+server if the standard Python SDK path is stable.
+
+Summarize an existing score file:
 
 ```powershell
 python -m odysseys_eval summarize `

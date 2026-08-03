@@ -47,6 +47,7 @@ Create a local `.env` file outside version control. Required values are usually:
 OPENAI_API_KEY=...
 OPENAI_BASE_URL=https://tokenhub.sensetime.com/v1
 OSWORLD_PATH=/path/to/OSWorld
+OSWORLD_VM_PATH=/path/to/Ubuntu.qcow2
 ```
 
 Do not commit API keys, VM images, run outputs, or `.env` files.
@@ -88,6 +89,15 @@ python -m odysseys_eval run-osworld \
   --result-dir outputs/runs_smoke_stable_gpt55 \
   --model gpt-5.5 \
   --max-steps 10
+```
+
+If a long run completes after the outer shell or Codex tool times out, repair the
+manifest and regenerate the report from landed artifacts:
+
+```bash
+python -m odysseys_eval finalize-run \
+  --prepared-dir outputs/dev_10 \
+  --result-dir outputs/runs_dev_10_gpt55
 ```
 
 Create the fixed development subset used for local/remote baseline runs:
@@ -146,20 +156,21 @@ OpenAI-compatible models are also supported via `OPENAI_API_KEY` and `--api-base
 For this fork's wrapper, the same judge can be launched through:
 
 ```bash
-ODYSSEYS_USE_CURL_OPENAI=1 python -m odysseys_eval score \
+python -m odysseys_eval score \
   --runs-dir outputs/runs_dev_10_gpt55/pyautogui/screenshot/gpt-5.5/mind2web_chrome \
   --task-source-json outputs/dev_10/selected_tasks.json \
   --output outputs/scores/dev_10_gpt55_eval.json \
+  --csv-output outputs/scores/dev_10_gpt55_eval.csv \
   --model gpt-5.5 \
   --num-workers 1 \
   --api-base https://tokenhub.sensetime.com/v1 \
   --env-file .env
 ```
 
-`ODYSSEYS_USE_CURL_OPENAI=1` is a Windows/local compatibility fallback for
-OpenAI-compatible endpoints. It avoids OpenSSL binding issues seen with some
-Python SDK imports. On a normal Linux server, the standard SDK path may work
-without this flag.
+`score` enables the `ODYSSEYS_USE_CURL_OPENAI=1` Windows/local compatibility
+fallback by default for OpenAI-compatible endpoints. It avoids OpenSSL binding
+issues seen with some Python SDK imports. On a normal Linux server, pass
+`--no-use-curl-openai` if the standard SDK path is preferred.
 
 We report two metrics per task. Averaged is the mean rubric score. Perfect is 1 if and only if every rubric is satisfied.
 

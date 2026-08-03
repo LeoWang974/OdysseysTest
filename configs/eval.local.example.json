@@ -3,6 +3,7 @@
   "outputs_dir": "outputs",
   "osworld": {
     "path_env": "OSWORLD_PATH",
+    "vm_path_env": "OSWORLD_VM_PATH",
     "provider_name": "docker",
     "path_to_vm": "C:/path/to/Ubuntu.qcow2",
     "observation_type": "screenshot",

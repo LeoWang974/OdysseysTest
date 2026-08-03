@@ -29,7 +29,7 @@ LOCAL_CHROME_STABILITY_ARGS = [
 
 
 def load_json(path: Path) -> Any:
-    with path.open("r", encoding="utf-8") as f:
+    with path.open("r", encoding="utf-8-sig") as f:
         return json.load(f)
 
 
@@ -172,6 +172,86 @@ def infer_env_provider(model: str) -> dict[str, str | None]:
     return {"provider": provider, "base_url": base_url}
 
 
+def resolve_repo_path(path: Path | None) -> Path | None:
+    if path is None:
+        return None
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
+def expected_tasks_from_prepared(prepared_dir: Path | None) -> dict[str, Any]:
+    if not prepared_dir:
+        return {"expected_tasks": None, "expected_task_ids": []}
+    meta_path = prepared_dir / "test_all.json"
+    if not meta_path.is_file():
+        return {"expected_tasks": None, "expected_task_ids": []}
+    meta = load_json(meta_path)
+    task_ids: list[str] = []
+    if isinstance(meta, dict):
+        for value in meta.values():
+            if isinstance(value, list):
+                task_ids.extend(str(item) for item in value)
+    return {"expected_tasks": len(task_ids), "expected_task_ids": task_ids}
+
+
+def completion_from_runs(result_dir: Path) -> dict[str, Any]:
+    summary_path = result_dir / "summary" / "results.json"
+    summary_rows = load_json(summary_path) if summary_path.is_file() else []
+    if not isinstance(summary_rows, list):
+        summary_rows = []
+    summary_task_ids = [str(row.get("task_id")) for row in summary_rows if isinstance(row, dict) and row.get("task_id")]
+    traj_task_ids = sorted({path.parent.name for path in result_dir.rglob("traj.jsonl")})
+    completed_task_ids = sorted(set(summary_task_ids) | set(traj_task_ids))
+    return {
+        "completed_tasks": len(completed_task_ids),
+        "completed_task_ids": completed_task_ids,
+        "summary_results_path": str(summary_path) if summary_path.is_file() else None,
+        "summary_results_count": len(summary_rows),
+        "trajectory_task_count": len(traj_task_ids),
+    }
+
+
+def finalize_run_manifest(
+    manifest_path: Path,
+    result_dir: Path,
+    prepared_dir: Path | None,
+    *,
+    exit_code: int | None = None,
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
+    status_hint: str | None = None,
+) -> dict[str, Any]:
+    manifest = load_json(manifest_path) if manifest_path.is_file() else {"schema_version": 1}
+    expected = expected_tasks_from_prepared(prepared_dir)
+    completion = completion_from_runs(result_dir)
+    expected_count = expected["expected_tasks"]
+    completed_count = completion["completed_tasks"]
+
+    manifest.update(expected)
+    manifest.update(completion)
+    if exit_code is not None:
+        manifest["exit_code"] = exit_code
+    if end_time is not None:
+        manifest["end_time"] = end_time.isoformat(timespec="seconds").replace("+00:00", "Z")
+    elif not manifest.get("end_time"):
+        manifest["end_time"] = utc_now_iso()
+    if start_time and end_time:
+        manifest["duration_seconds"] = round((end_time - start_time).total_seconds(), 3)
+
+    if status_hint:
+        manifest["status"] = status_hint
+    elif expected_count and completed_count >= expected_count:
+        manifest["status"] = "success" if manifest.get("exit_code") == 0 else "success_inferred"
+    elif completed_count:
+        manifest["status"] = "partial"
+    elif manifest.get("exit_code") not in (None, 0):
+        manifest["status"] = "failed"
+    else:
+        manifest["status"] = manifest.get("status", "unknown")
+
+    write_json(manifest_path, manifest)
+    return manifest
+
+
 def cmd_doctor(_: argparse.Namespace) -> int:
     load_dotenv_file(REPO_ROOT / ".env")
     print(f"repo_root: {REPO_ROOT}")
@@ -194,6 +274,8 @@ def cmd_doctor(_: argparse.Namespace) -> int:
 
     osworld_path = os.getenv("OSWORLD_PATH")
     print(f"env: OSWORLD_PATH={osworld_path or 'unset'}")
+    vm_path = os.getenv("OSWORLD_VM_PATH")
+    print(f"env: OSWORLD_VM_PATH={vm_path or 'unset'}")
     return 0
 
 
@@ -250,17 +332,24 @@ def cmd_score(args: argparse.Namespace) -> int:
     env_file = args.env_file or (REPO_ROOT / ".env")
     load_dotenv_file(env_file)
     api_base = args.api_base or os.getenv("OPENAI_BASE_URL") or os.getenv("OPENAI_API_BASE") or os.getenv("NEWAPI_BASE_URL")
+    output = resolve_repo_path(args.output).resolve()
+    runs_dir = resolve_repo_path(args.runs_dir).resolve()
+    task_source_json = resolve_repo_path(args.task_source_json).resolve()
+    manifest_output = resolve_repo_path(args.manifest_output)
+    if manifest_output is None:
+        manifest_output = output.with_suffix(".manifest.json")
+    manifest_output = manifest_output.resolve()
     command = [
         sys.executable,
         str(JUDGE_SCRIPT),
         "--model",
         args.model,
         "--runs-dir",
-        str(args.runs_dir),
+        str(runs_dir),
         "--task-source-json",
-        str(args.task_source_json),
+        str(task_source_json),
         "--output",
-        str(args.output),
+        str(output),
         "--num-workers",
         str(args.num_workers),
         "--max-images",
@@ -275,9 +364,52 @@ def cmd_score(args: argparse.Namespace) -> int:
     if env_file.is_file():
         command.extend(["--env-file", str(env_file)])
 
+    env = os.environ.copy()
+    if args.use_curl_openai:
+        env["ODYSSEYS_USE_CURL_OPENAI"] = "1"
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+
+    start = datetime.now(timezone.utc)
+    manifest = {
+        "schema_version": 1,
+        "status": "running",
+        "model": args.model,
+        "runs_dir": str(runs_dir),
+        "task_source_json": str(task_source_json),
+        "output": str(output),
+        "num_workers": args.num_workers,
+        "max_images": args.max_images,
+        "max_steps": args.max_steps,
+        "include_incomplete": args.include_incomplete,
+        "api_base": api_base,
+        "env_provider": infer_env_provider(args.model),
+        "env_flags": {
+            "ODYSSEYS_USE_CURL_OPENAI": env.get("ODYSSEYS_USE_CURL_OPENAI"),
+            "PYTHONIOENCODING": env.get("PYTHONIOENCODING"),
+        },
+        "command": command,
+        "start_time": start.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "end_time": None,
+        "duration_seconds": None,
+        "exit_code": None,
+        "git": {"odysseys": git_info(REPO_ROOT)},
+    }
+    write_json(manifest_output, manifest)
+
     print("Running rubric judge...")
-    subprocess.run(command, cwd=REPO_ROOT, check=True)
-    return 0
+    completed = subprocess.run(command, cwd=REPO_ROOT, env=env)
+    end = datetime.now(timezone.utc)
+    manifest["status"] = "success" if completed.returncode == 0 else "failed"
+    manifest["end_time"] = end.isoformat(timespec="seconds").replace("+00:00", "Z")
+    manifest["duration_seconds"] = round((end - start).total_seconds(), 3)
+    manifest["exit_code"] = completed.returncode
+    write_json(manifest_output, manifest)
+    print(f"Score manifest: {manifest_output}")
+
+    if completed.returncode == 0 and args.csv_output:
+        summarize_args = argparse.Namespace(eval_results=output, csv_output=resolve_repo_path(args.csv_output))
+        cmd_summarize(summarize_args)
+    return completed.returncode
 
 
 def cmd_summarize(args: argparse.Namespace) -> int:
@@ -289,29 +421,32 @@ def cmd_summarize(args: argparse.Namespace) -> int:
 
     if args.csv_output:
         args.csv_output.parent.mkdir(parents=True, exist_ok=True)
-        with args.csv_output.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=[
-                    "task_id",
-                    "num_steps",
-                    "average_rubric_score",
-                    "perfect",
-                    "num_screenshots_sent",
-                    "error",
-                ],
-            )
-            writer.writeheader()
-            for item in tasks:
-                writer.writerow({
-                    "task_id": item.get("task_id"),
-                    "num_steps": item.get("num_steps"),
-                    "average_rubric_score": item.get("average_rubric_score"),
-                    "perfect": item.get("perfect"),
-                    "num_screenshots_sent": item.get("num_screenshots_sent"),
-                    "error": item.get("error", ""),
-                })
-        print(f"Wrote CSV: {args.csv_output}")
+        try:
+            with args.csv_output.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=[
+                        "task_id",
+                        "num_steps",
+                        "average_rubric_score",
+                        "perfect",
+                        "num_screenshots_sent",
+                        "error",
+                    ],
+                )
+                writer.writeheader()
+                for item in tasks:
+                    writer.writerow({
+                        "task_id": item.get("task_id"),
+                        "num_steps": item.get("num_steps"),
+                        "average_rubric_score": item.get("average_rubric_score"),
+                        "perfect": item.get("perfect"),
+                        "num_screenshots_sent": item.get("num_screenshots_sent"),
+                        "error": item.get("error", ""),
+                    })
+            print(f"Wrote CSV: {args.csv_output}")
+        except PermissionError as exc:
+            print(f"WARNING: could not write CSV because the file is locked: {args.csv_output} ({exc})")
     return 0
 
 
@@ -375,8 +510,9 @@ def cmd_osworld_command(args: argparse.Namespace) -> int:
         "--domain",
         args.domain,
     ]
-    if args.path_to_vm:
-        command.extend(["--path_to_vm", args.path_to_vm])
+    vm_path = repair_mojibake(args.path_to_vm or os.getenv("OSWORLD_VM_PATH"))
+    if vm_path:
+        command.extend(["--path_to_vm", vm_path])
     print(f"cd {osworld_path}")
     print(" ".join(shlex.quote(part) for part in command))
     return 0
@@ -387,6 +523,7 @@ def build_osworld_run_command(
     result_dir: Path,
     prepared_dir: Path,
     args: argparse.Namespace,
+    vm_path: str | None,
 ) -> list[str]:
     test_base = (prepared_dir / "osworld_examples").resolve()
     meta_path = (prepared_dir / "test_all.json").resolve()
@@ -414,7 +551,6 @@ def build_osworld_run_command(
     ]
     if args.headless:
         command.append("--headless")
-    vm_path = repair_mojibake(args.path_to_vm)
     if vm_path:
         command.extend(["--path_to_vm", vm_path])
     return command
@@ -440,12 +576,11 @@ def cmd_run_osworld(args: argparse.Namespace) -> int:
     result_dir.mkdir(parents=True, exist_ok=True)
     console_log = result_dir / "run_console.log"
     manifest_path = result_dir / "run_manifest.json"
-    report_output = args.report_output
-    if report_output and not report_output.is_absolute():
-        report_output = REPO_ROOT / report_output
+    report_output = resolve_repo_path(args.report_output)
+    vm_path = repair_mojibake(args.path_to_vm or os.getenv("OSWORLD_VM_PATH"))
 
     osworld_python = args.python or sys.executable
-    command = build_osworld_run_command(osworld_python, result_dir, prepared_dir, args)
+    command = build_osworld_run_command(osworld_python, result_dir, prepared_dir, args, vm_path)
     env = os.environ.copy()
     if args.openai_base_url:
         env["OPENAI_BASE_URL"] = args.openai_base_url
@@ -468,7 +603,7 @@ def cmd_run_osworld(args: argparse.Namespace) -> int:
         "prepared_subset": str(prepared_dir),
         "result_dir": str(result_dir),
         "osworld_path": str(osworld_path),
-        "vm_path": repair_mojibake(args.path_to_vm),
+        "vm_path": vm_path,
         "provider_name": args.provider_name,
         "observation_type": args.observation_type,
         "domain": args.domain,
@@ -490,6 +625,7 @@ def cmd_run_osworld(args: argparse.Namespace) -> int:
             "osworld": git_info(osworld_path),
         },
     }
+    manifest.update(expected_tasks_from_prepared(prepared_dir))
     write_json(manifest_path, manifest)
 
     print(f"Running OSWorld: {result_dir}")
@@ -499,11 +635,14 @@ def cmd_run_osworld(args: argparse.Namespace) -> int:
         completed = subprocess.run(command, cwd=osworld_path, env=env, stdout=log, stderr=subprocess.STDOUT)
     ended = datetime.now(timezone.utc)
 
-    manifest["status"] = "success" if completed.returncode == 0 else "failed"
-    manifest["end_time"] = ended.isoformat(timespec="seconds").replace("+00:00", "Z")
-    manifest["duration_seconds"] = round((ended - started).total_seconds(), 3)
-    manifest["exit_code"] = completed.returncode
-    write_json(manifest_path, manifest)
+    manifest = finalize_run_manifest(
+        manifest_path,
+        result_dir,
+        prepared_dir,
+        exit_code=completed.returncode,
+        start_time=started,
+        end_time=ended,
+    )
 
     print(f"OSWorld exit_code={completed.returncode}, duration_seconds={manifest['duration_seconds']}")
     print(f"Console log: {console_log}")
@@ -518,6 +657,42 @@ def cmd_run_osworld(args: argparse.Namespace) -> int:
         )
         cmd_smoke_report(report_args)
     return completed.returncode
+
+
+def cmd_finalize_run(args: argparse.Namespace) -> int:
+    result_dir = resolve_repo_path(args.result_dir).resolve()
+    prepared_dir = resolve_repo_path(args.prepared_dir)
+    if prepared_dir:
+        prepared_dir = prepared_dir.resolve()
+    manifest_path = resolve_repo_path(args.manifest) or (result_dir / "run_manifest.json")
+    manifest_path = manifest_path.resolve()
+    manifest = finalize_run_manifest(
+        manifest_path,
+        result_dir,
+        prepared_dir,
+        exit_code=args.exit_code,
+        status_hint=args.status,
+    )
+    print(f"Finalized run manifest: {manifest_path}")
+    print(json.dumps({
+        "status": manifest.get("status"),
+        "expected_tasks": manifest.get("expected_tasks"),
+        "completed_tasks": manifest.get("completed_tasks"),
+        "summary_results_count": manifest.get("summary_results_count"),
+        "trajectory_task_count": manifest.get("trajectory_task_count"),
+    }, indent=2, ensure_ascii=False))
+
+    if args.write_report:
+        console_log = resolve_repo_path(args.console_log) or (result_dir / "run_console.log")
+        report_output = resolve_repo_path(args.report_output) or (REPO_ROOT / "outputs" / "reports" / f"{result_dir.name}_report.json")
+        report_args = argparse.Namespace(
+            runs_dir=result_dir,
+            console_log=console_log,
+            output=report_output,
+            csv_output=report_output.with_suffix(".csv") if args.write_csv else None,
+        )
+        cmd_smoke_report(report_args)
+    return 0
 
 
 def parse_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -631,11 +806,14 @@ def cmd_smoke_report(args: argparse.Namespace) -> int:
 
     if args.csv_output:
         args.csv_output.parent.mkdir(parents=True, exist_ok=True)
-        with args.csv_output.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(task_reports[0].keys()) if task_reports else ["task_id"])
-            writer.writeheader()
-            writer.writerows(task_reports)
-        print(f"Wrote CSV: {args.csv_output}")
+        try:
+            with args.csv_output.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=list(task_reports[0].keys()) if task_reports else ["task_id"])
+                writer.writeheader()
+                writer.writerows(task_reports)
+            print(f"Wrote CSV: {args.csv_output}")
+        except PermissionError as exc:
+            print(f"WARNING: could not write CSV because the file is locked: {args.csv_output} ({exc})")
     return 0
 
 
@@ -689,6 +867,9 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument("--include-incomplete", action="store_true")
     score.add_argument("--api-base", default=None)
     score.add_argument("--env-file", type=Path, default=None)
+    score.add_argument("--use-curl-openai", action=argparse.BooleanOptionalAction, default=True)
+    score.add_argument("--manifest-output", type=Path, default=None)
+    score.add_argument("--csv-output", type=Path, default=None, help="Optional per-task CSV written after successful scoring.")
     score.set_defaults(func=cmd_score)
 
     summarize = sub.add_parser("summarize", help="Print score summary and optionally export per-task CSV.")
@@ -717,7 +898,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_osworld.add_argument("--prepared-dir", type=Path, required=True)
     run_osworld.add_argument("--result-dir", type=Path, required=True)
     run_osworld.add_argument("--osworld-path", type=str, default=None)
-    run_osworld.add_argument("--path-to-vm", default=r"C:\zhuchangbiaozhu_xyl\桌面\Ubuntu.qcow2")
+    run_osworld.add_argument("--path-to-vm", default=None, help="VM image path. Defaults to OSWORLD_VM_PATH from .env.")
     run_osworld.add_argument("--provider-name", default="docker")
     run_osworld.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True)
     run_osworld.add_argument("--observation-type", default="screenshot", choices=["screenshot", "a11y_tree", "screenshot_a11y_tree", "som"])
@@ -732,6 +913,18 @@ def build_parser() -> argparse.ArgumentParser:
     run_osworld.add_argument("--write-report", action=argparse.BooleanOptionalAction, default=True)
     run_osworld.add_argument("--report-output", type=Path, default=None)
     run_osworld.set_defaults(func=cmd_run_osworld)
+
+    finalize = sub.add_parser("finalize-run", help="Repair/finalize a run manifest and optionally regenerate the runner report.")
+    finalize.add_argument("--result-dir", type=Path, required=True)
+    finalize.add_argument("--prepared-dir", type=Path, default=None)
+    finalize.add_argument("--manifest", type=Path, default=None)
+    finalize.add_argument("--exit-code", type=int, default=None)
+    finalize.add_argument("--status", choices=["success", "success_inferred", "partial", "failed"], default=None)
+    finalize.add_argument("--write-report", action=argparse.BooleanOptionalAction, default=True)
+    finalize.add_argument("--write-csv", action=argparse.BooleanOptionalAction, default=True)
+    finalize.add_argument("--console-log", type=Path, default=None)
+    finalize.add_argument("--report-output", type=Path, default=None)
+    finalize.set_defaults(func=cmd_finalize_run)
 
     smoke_report = sub.add_parser("smoke-report", help="Summarize OSWorld smoke run health and cost signals.")
     smoke_report.add_argument("--runs-dir", type=Path, required=True)
