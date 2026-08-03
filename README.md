@@ -29,6 +29,93 @@ Difficulty is assigned by step count and domain spread. Easy tasks use at most 5
 
 We use the [OSWorld](https://github.com/xlang-ai/OSWorld) runner with Chrome in an Ubuntu VM, a 100-step budget, and maximum reasoning effort.
 
+### Local orchestration in this fork
+
+This fork keeps the upstream Odysseys data and official scoring script, and adds
+a local orchestration layer in [`odysseys_eval/`](odysseys_eval/) for reproducible
+OSWorld runs, smoke reports, and rubric judging.
+
+Install the lightweight local dependencies:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+Create a local `.env` file outside version control. Required values are usually:
+
+```text
+OPENAI_API_KEY=...
+OPENAI_BASE_URL=https://tokenhub.sensetime.com/v1
+OSWORLD_PATH=/path/to/OSWorld
+```
+
+Do not commit API keys, VM images, run outputs, or `.env` files.
+
+Check the repository and environment:
+
+```bash
+python -m odysseys_eval doctor
+```
+
+Prepare a stable one-task smoke subset for local testing:
+
+```bash
+python -m odysseys_eval prepare \
+  --level easy \
+  --limit 1 \
+  --output-dir outputs/smoke_stable \
+  --start-url about:blank \
+  --local-chrome-stability
+```
+
+`--local-chrome-stability` injects Chrome launch flags into generated OSWorld
+examples to bypass certificate interstitials in the Docker VM:
+
+- `--ignore-certificate-errors`
+- `--ignore-ssl-errors`
+- `--allow-running-insecure-content`
+- `--test-type`
+
+Run OSWorld through the local wrapper. The wrapper writes `run_console.log`,
+`run_manifest.json`, and a runner report with steps, screenshots, token usage,
+duration, and error counters. The manifest records model, step budget, prepared
+subset, OSWorld path, VM path, start/end time, git commit/status, and environment
+provider, but never API keys.
+
+```bash
+python -m odysseys_eval run-osworld \
+  --prepared-dir outputs/smoke_stable \
+  --result-dir outputs/runs_smoke_stable_gpt55 \
+  --model gpt-5.5 \
+  --max-steps 10
+```
+
+Create the fixed development subset used for local/remote baseline runs:
+
+```bash
+python -m odysseys_eval prepare-dev-subset \
+  --output-dir outputs/dev_10 \
+  --easy 4 \
+  --medium 3 \
+  --hard 3 \
+  --start-url about:blank \
+  --local-chrome-stability
+```
+
+Run the development baseline:
+
+```bash
+python -m odysseys_eval run-osworld \
+  --prepared-dir outputs/dev_10 \
+  --result-dir outputs/runs_dev_10_gpt55 \
+  --model gpt-5.5 \
+  --max-steps 30
+```
+
+On Linux servers, run long experiments inside `tmux` or `screen`. The local
+Windows Docker setup is useful for smoke tests, but full or multi-model
+experiments should run on a server with Docker and KVM acceleration.
+
 Convert tasks to per-file OSWorld examples.
 
 ```bash
@@ -55,6 +142,24 @@ GEMINI_API_KEY=your-key python scripts/python/run_full_trajectory_per_rubric.py 
 ```
 
 OpenAI-compatible models are also supported via `OPENAI_API_KEY` and `--api-base`. API keys may be provided through environment variables, CLI flags, or a `.env` file in the current directory (or via `--env-file path/to/.env`); install `python-dotenv` to enable `.env` loading. Results are written as JSON with per-rubric scores plus an aggregate `summary` broken down by difficulty level.
+
+For this fork's wrapper, the same judge can be launched through:
+
+```bash
+ODYSSEYS_USE_CURL_OPENAI=1 python -m odysseys_eval score \
+  --runs-dir outputs/runs_dev_10_gpt55/pyautogui/screenshot/gpt-5.5/mind2web_chrome \
+  --task-source-json outputs/dev_10/selected_tasks.json \
+  --output outputs/scores/dev_10_gpt55_eval.json \
+  --model gpt-5.5 \
+  --num-workers 1 \
+  --api-base https://tokenhub.sensetime.com/v1 \
+  --env-file .env
+```
+
+`ODYSSEYS_USE_CURL_OPENAI=1` is a Windows/local compatibility fallback for
+OpenAI-compatible endpoints. It avoids OpenSSL binding issues seen with some
+Python SDK imports. On a normal Linux server, the standard SDK path may work
+without this flag.
 
 We report two metrics per task. Averaged is the mean rubric score. Perfect is 1 if and only if every rubric is satisfied.
 

@@ -1,0 +1,43 @@
+{
+  "task_source_json": "data/odysseys.json",
+  "outputs_dir": "outputs",
+  "osworld": {
+    "path_env": "OSWORLD_PATH",
+    "provider_name": "docker",
+    "path_to_vm": "C:/path/to/Ubuntu.qcow2",
+    "observation_type": "screenshot",
+    "headless": true,
+    "sleep_after_execution": 0.0
+  },
+  "agent": {
+    "model": "gpt-5.5",
+    "max_steps_smoke": 10,
+    "max_steps_dev": 30,
+    "openai_base_url": "https://tokenhub.sensetime.com/v1",
+    "use_curl_openai": true
+  },
+  "subsets": {
+    "smoke_stable": {
+      "level": "easy",
+      "limit": 1,
+      "start_url": "about:blank",
+      "local_chrome_stability": true
+    },
+    "dev_10": {
+      "easy": 4,
+      "medium": 3,
+      "hard": 3,
+      "start_url": "about:blank",
+      "local_chrome_stability": true
+    }
+  },
+  "judge": {
+    "model": "gpt-5.5",
+    "num_workers": 1,
+    "max_images": 0,
+    "max_steps": 100,
+    "include_incomplete": false,
+    "api_base": "https://tokenhub.sensetime.com/v1",
+    "use_curl_openai": true
+  }
+}

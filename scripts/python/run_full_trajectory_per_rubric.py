@@ -18,11 +18,11 @@ import math
 import mimetypes
 import os
 import re
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
-from google import genai
-from google.genai import types
 from openai import AsyncOpenAI
 
 try:
@@ -63,6 +63,7 @@ def append_unique(items: list[str], value: str) -> None:
 
 def make_client(args: argparse.Namespace) -> tuple[str, Any]:
     if args.model.lower().startswith("gemini"):
+        from google import genai
         api_key = args.gemini_api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
         if not api_key:
             raise SystemExit("Gemini API key required. Set GEMINI_API_KEY / GOOGLE_API_KEY or pass --gemini-api-key.")
@@ -70,10 +71,53 @@ def make_client(args: argparse.Namespace) -> tuple[str, Any]:
     api_key = args.api_key or os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise SystemExit("OpenAI API key required. Set OPENAI_API_KEY or pass --api-key.")
+    if os.getenv("ODYSSEYS_USE_CURL_OPENAI") == "1":
+        return "openai_curl", {"api_key": api_key, "api_base": args.api_base or "https://api.openai.com/v1"}
     kwargs = {"api_key": api_key}
     if args.api_base:
         kwargs["base_url"] = args.api_base
     return "openai", AsyncOpenAI(**kwargs)
+
+
+def post_openai_chat_with_curl(client: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
+    api_base = client["api_base"].rstrip("/")
+    api_url = f"{api_base}/chat/completions"
+    with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json", encoding="utf-8") as request_file:
+        json.dump(payload, request_file, ensure_ascii=False)
+        request_path = request_file.name
+    with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json", encoding="utf-8") as response_file:
+        response_path = response_file.name
+    try:
+        command = [
+            "curl.exe",
+            "-k",
+            "-sS",
+            "-X",
+            "POST",
+            api_url,
+            "-H",
+            "Content-Type: application/json",
+            "-H",
+            f"Authorization: Bearer {client['api_key']}",
+            "--data-binary",
+            f"@{request_path}",
+            "-o",
+            response_path,
+            "-w",
+            "%{http_code}",
+        ]
+        result = subprocess.run(command, text=True, capture_output=True, timeout=240)
+        status_code = int((result.stdout or "0").strip()[-3:] or "0")
+        response_text = Path(response_path).read_text(encoding="utf-8", errors="replace")
+        if status_code != 200:
+            raise RuntimeError(f"HTTP {status_code}: {response_text or result.stderr}")
+        return json.loads(response_text)
+    finally:
+        for path in (request_path, response_path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 def empty_result(run_dir: Path, task_id: str, task: str, rubrics: list[dict[str, Any]], error: str) -> dict[str, Any]:
@@ -216,12 +260,20 @@ async def evaluate_run(run_dir: Path, client: Any, backend: str, model: str, tas
         )
         try:
             if backend == "gemini":
+                from google.genai import types
                 response = await client.aio.models.generate_content(
                     model=model,
                     contents=[types.Content(role="user", parts=[types.Part.from_text(text=user_text)] + [types.Part.from_bytes(data=s["bytes"], mime_type=s["mime"]) for s in screenshot_assets])],
                     config=types.GenerateContentConfig(system_instruction=FULL_TRAJ_JUDGMENT_SYSTEM, max_output_tokens=FINAL_JUDGMENT_MAX_COMPLETION_TOKENS),
                 )
                 result_text = str(response.text or "").strip()
+            elif backend == "openai_curl":
+                response_json = await asyncio.to_thread(post_openai_chat_with_curl, client, {
+                    "model": model,
+                    "messages": [{"role": "system", "content": FULL_TRAJ_JUDGMENT_SYSTEM}, {"role": "user", "content": [{"type": "text", "text": user_text}] + [{"type": "image_url", "image_url": {"url": s["data_url"], "detail": "high"}} for s in screenshot_assets]}],
+                    "max_completion_tokens": FINAL_JUDGMENT_MAX_COMPLETION_TOKENS,
+                })
+                result_text = str(response_json["choices"][0]["message"].get("content") or "").strip()
             else:
                 response = await client.chat.completions.create(
                     model=model,
@@ -334,7 +386,8 @@ async def main_async(args: argparse.Namespace) -> None:
     new_results = []
     if pending:
         concurrency = min(max(1, args.num_workers), len(pending))
-        print(f"Backend: {'gemini' if args.model.lower().startswith('gemini') else 'openai'} ({args.model}), concurrency={concurrency}")
+        backend_label = 'gemini' if args.model.lower().startswith('gemini') else ('openai_curl' if os.getenv("ODYSSEYS_USE_CURL_OPENAI") == "1" else 'openai')
+        print(f"Backend: {backend_label} ({args.model}), concurrency={concurrency}")
         backend, client = make_client(args)
         semaphore = asyncio.Semaphore(concurrency)
 

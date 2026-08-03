@@ -1,0 +1,42 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+configs/*.local.json
+
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Evaluation outputs and logs
+outputs/
+local_runs/
+run_console.log
+run_manifest.json
+*.log
+
+# Large VM / dataset artifacts
+*.qcow2
+*.vmdk
+*.ova
+*.iso
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Local scratch files
+.tmp_check/
+tmp/
+temp/
+.DS_Store
+Thumbs.db
