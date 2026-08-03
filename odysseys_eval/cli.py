@@ -817,6 +817,148 @@ def cmd_smoke_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def task_metadata_by_id(task_source_json: Path | None) -> dict[str, dict[str, Any]]:
+    if not task_source_json or not task_source_json.is_file():
+        return {}
+    tasks = load_json(task_source_json)
+    if not isinstance(tasks, list):
+        return {}
+    metadata = {}
+    for task in tasks:
+        if not isinstance(task, dict) or not task.get("task_id"):
+            continue
+        rubrics = task.get("rubrics", {})
+        metadata[str(task["task_id"])] = {
+            "level": task.get("level"),
+            "reference_length": task.get("reference_length"),
+            "num_rubrics": len(rubrics) if isinstance(rubrics, dict) else None,
+            "task": task.get("confirmed_task"),
+        }
+    return metadata
+
+
+def mean(values: list[float]) -> float | None:
+    return round(sum(values) / len(values), 6) if values else None
+
+
+def cmd_merge_report(args: argparse.Namespace) -> int:
+    runner_report = load_json(resolve_repo_path(args.runner_report).resolve())
+    score_results = load_json(resolve_repo_path(args.score_results).resolve())
+    task_source_json = resolve_repo_path(args.task_source_json)
+    task_meta = task_metadata_by_id(task_source_json.resolve() if task_source_json else None)
+    output = resolve_repo_path(args.output).resolve()
+    csv_output = resolve_repo_path(args.csv_output)
+    if csv_output:
+        csv_output = csv_output.resolve()
+
+    runner_by_task = {str(item.get("task_id")): item for item in runner_report.get("tasks", []) if item.get("task_id")}
+    score_by_task = {str(item.get("task_id")): item for item in score_results.get("tasks", []) if item.get("task_id")}
+    task_ids = sorted(set(runner_by_task) | set(score_by_task) | set(task_meta))
+
+    rows = []
+    for task_id in task_ids:
+        runner = runner_by_task.get(task_id, {})
+        score = score_by_task.get(task_id, {})
+        meta = task_meta.get(task_id, {})
+        steps = score.get("num_steps") or runner.get("steps") or 0
+        rubric_avg = score.get("average_rubric_score")
+        try:
+            efficiency = round(float(rubric_avg) / int(steps), 8) if rubric_avg is not None and int(steps) > 0 else None
+        except (TypeError, ValueError):
+            efficiency = None
+        rows.append({
+            "task_id": task_id,
+            "model": args.model,
+            "level": meta.get("level"),
+            "reference_length": meta.get("reference_length"),
+            "num_rubrics": meta.get("num_rubrics") or len(score.get("rubric_scores", {}) or {}),
+            "rubric_avg": rubric_avg,
+            "perfect": score.get("perfect"),
+            "trajectory_efficiency": efficiency,
+            "judge_num_steps": score.get("num_steps"),
+            "runner_steps": runner.get("steps"),
+            "max_step_num": runner.get("max_step_num"),
+            "screenshots": runner.get("screenshots"),
+            "screenshots_sent": score.get("num_screenshots_sent"),
+            "osworld_status": runner.get("status"),
+            "osworld_score": runner.get("score"),
+            "osworld_task_sr": runner.get("task_sr"),
+            "prompt_tokens": runner.get("prompt_tokens"),
+            "completion_tokens": runner.get("completion_tokens"),
+            "total_tokens": runner.get("total_tokens"),
+            "calls_with_usage": runner.get("calls_with_usage"),
+            "trajectory_errors": runner.get("trajectory_errors"),
+            "runtime_error_mentions": runner.get("runtime_error_mentions"),
+            "judge_error": score.get("error", ""),
+            "run_dir": score.get("run_dir"),
+        })
+
+    scored_rows = [row for row in rows if row["rubric_avg"] is not None]
+    perfect_count = sum(1 for row in scored_rows if row.get("perfect") is True)
+    total_tokens = sum(int(row["total_tokens"] or 0) for row in rows)
+    judge_total_steps = sum(int(row["judge_num_steps"] or 0) for row in rows)
+    runner_total_steps = sum(int(row["runner_steps"] or 0) for row in rows)
+    summary = {
+        "model": args.model,
+        "tasks": len(rows),
+        "scored_tasks": len(scored_rows),
+        "total_rubrics": sum(int(row["num_rubrics"] or 0) for row in rows),
+        "average_rubric_score": mean([float(row["rubric_avg"]) for row in scored_rows]),
+        "perfect_tasks": perfect_count,
+        "perfect_task_rate": round(perfect_count / len(scored_rows), 6) if scored_rows else None,
+        "trajectory_efficiency": mean([float(row["trajectory_efficiency"]) for row in rows if row["trajectory_efficiency"] is not None]),
+        "trajectory_efficiency_x100": mean([float(row["trajectory_efficiency"]) * 100 for row in rows if row["trajectory_efficiency"] is not None]),
+        "osworld_task_success_rate": runner_report.get("summary", {}).get("task_success_rate"),
+        "total_steps": runner_total_steps or judge_total_steps,
+        "runner_total_steps": runner_total_steps,
+        "judge_total_steps": judge_total_steps,
+        "average_steps": mean([float(row["judge_num_steps"] or row["runner_steps"]) for row in rows if row["judge_num_steps"] or row["runner_steps"]]),
+        "prompt_tokens": sum(int(row["prompt_tokens"] or 0) for row in rows),
+        "completion_tokens": sum(int(row["completion_tokens"] or 0) for row in rows),
+        "total_tokens": total_tokens,
+        "average_tokens_per_task": round(total_tokens / len(rows), 3) if rows else None,
+        "calls_with_usage": sum(int(row["calls_with_usage"] or 0) for row in rows),
+        "trajectory_errors": sum(int(row["trajectory_errors"] or 0) for row in rows),
+        "runtime_error_mentions": sum(int(row["runtime_error_mentions"] or 0) for row in rows),
+        "judge_errored_tasks": sum(1 for row in rows if row.get("judge_error")),
+        "runner_duration_seconds": runner_report.get("summary", {}).get("duration_seconds"),
+        "runner_report": str(resolve_repo_path(args.runner_report).resolve()),
+        "score_results": str(resolve_repo_path(args.score_results).resolve()),
+        "task_source_json": str(task_source_json.resolve()) if task_source_json else None,
+    }
+    by_level: dict[str, dict[str, Any]] = {}
+    for level in sorted({row.get("level") or "unknown" for row in rows}):
+        level_rows = [row for row in rows if (row.get("level") or "unknown") == level]
+        level_scored = [row for row in level_rows if row["rubric_avg"] is not None]
+        level_perfect = sum(1 for row in level_scored if row.get("perfect") is True)
+        by_level[level] = {
+            "tasks": len(level_rows),
+            "average_rubric_score": mean([float(row["rubric_avg"]) for row in level_scored]),
+            "perfect_task_rate": round(level_perfect / len(level_scored), 6) if level_scored else None,
+            "average_steps": mean([float(row["judge_num_steps"] or row["runner_steps"]) for row in level_rows if row["judge_num_steps"] or row["runner_steps"]]),
+            "total_tokens": sum(int(row["total_tokens"] or 0) for row in level_rows),
+        }
+    summary["by_level"] = by_level
+
+    merged = {"summary": summary, "tasks": rows}
+    write_json(output, merged)
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    print(f"Wrote merged report: {output}")
+
+    if csv_output:
+        csv_output.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with csv_output.open("w", newline="", encoding="utf-8") as f:
+                fieldnames = list(rows[0].keys()) if rows else ["task_id"]
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+            print(f"Wrote merged CSV: {csv_output}")
+        except PermissionError as exc:
+            print(f"WARNING: could not write CSV because the file is locked: {csv_output} ({exc})")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Local orchestration for Odysseys reproduction runs.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -932,6 +1074,15 @@ def build_parser() -> argparse.ArgumentParser:
     smoke_report.add_argument("--output", type=Path, required=True)
     smoke_report.add_argument("--csv-output", type=Path, default=None)
     smoke_report.set_defaults(func=cmd_smoke_report)
+
+    merge = sub.add_parser("merge-report", help="Merge runner health/cost report with rubric judge scores.")
+    merge.add_argument("--runner-report", type=Path, required=True)
+    merge.add_argument("--score-results", type=Path, required=True)
+    merge.add_argument("--task-source-json", type=Path, default=None)
+    merge.add_argument("--output", type=Path, required=True)
+    merge.add_argument("--csv-output", type=Path, default=None)
+    merge.add_argument("--model", default=None)
+    merge.set_defaults(func=cmd_merge_report)
 
     return parser
 

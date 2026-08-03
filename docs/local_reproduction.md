@@ -205,6 +205,23 @@ Judge metrics include:
 - trajectory efficiency
 - per-difficulty breakdown
 
+## Merged Baseline Report
+
+Merge the runner report and rubric score into a single model-comparison table:
+
+```powershell
+python -m odysseys_eval merge-report `
+  --runner-report outputs\reports\dev_10_gpt55_runner_report.json `
+  --score-results outputs\scores\dev_10_gpt55_eval.json `
+  --task-source-json outputs\dev_10\selected_tasks.json `
+  --output outputs\leaderboards\dev_10_gpt55_baseline.json `
+  --csv-output outputs\leaderboards\dev_10_gpt55_baseline.csv `
+  --model gpt-5.5
+```
+
+The fixed local baseline is summarized in
+[`docs/baselines/dev_10_gpt55_baseline.md`](baselines/dev_10_gpt55_baseline.md).
+
 ## Server Migration Checklist
 
 1. Push this repository to GitHub.

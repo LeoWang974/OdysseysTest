@@ -172,6 +172,21 @@ fallback by default for OpenAI-compatible endpoints. It avoids OpenSSL binding
 issues seen with some Python SDK imports. On a normal Linux server, pass
 `--no-use-curl-openai` if the standard SDK path is preferred.
 
+Merge runner health/cost metrics with rubric scores:
+
+```bash
+python -m odysseys_eval merge-report \
+  --runner-report outputs/reports/dev_10_gpt55_runner_report.json \
+  --score-results outputs/scores/dev_10_gpt55_eval.json \
+  --task-source-json outputs/dev_10/selected_tasks.json \
+  --output outputs/leaderboards/dev_10_gpt55_baseline.json \
+  --csv-output outputs/leaderboards/dev_10_gpt55_baseline.csv \
+  --model gpt-5.5
+```
+
+The first fixed local `dev_10` baseline is documented at
+[`docs/baselines/dev_10_gpt55_baseline.md`](docs/baselines/dev_10_gpt55_baseline.md).
+
 We report two metrics per task. Averaged is the mean rubric score. Perfect is 1 if and only if every rubric is satisfied.
 
 We also report Trajectory Efficiency, the per-task averaged rubric score divided by step count, averaged across tasks.
