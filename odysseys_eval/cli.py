@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import importlib.util
 import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from collections import Counter
@@ -157,6 +159,51 @@ def command_available(command: str) -> bool:
         return False
 
 
+def terminate_process_tree(proc: subprocess.Popen[Any]) -> None:
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    else:
+        proc.kill()
+
+
+def run_capture_with_timeout(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str] | None,
+    timeout_seconds: float | None,
+) -> tuple[int, str, str, str | None]:
+    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+    proc = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=creationflags,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_seconds)
+        return proc.returncode or 0, stdout or "", stderr or "", None
+    except subprocess.TimeoutExpired:
+        terminate_process_tree(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = "", ""
+        return 124, stdout or "", stderr or "", f"timeout after {timeout_seconds} seconds"
+
+
 def git_info(path: Path) -> dict[str, Any]:
     info: dict[str, Any] = {"path": str(path)}
     try:
@@ -219,6 +266,436 @@ def agentv4_health(agentv4_path: Path) -> dict[str, Any]:
     health["ready"] = all(bool(health[key]) for key in required)
     health["blocking"] = [key for key in required if not health[key]]
     return health
+
+
+def agentv4_api_key_env_for_model(model: str, explicit: str | None = None) -> str:
+    if explicit:
+        return explicit
+    lower = model.lower()
+    if lower.startswith("claude"):
+        return "ANTHROPIC_API_KEY"
+    if lower.startswith("gemini"):
+        return "GEMINI_API_KEY"
+    if lower.startswith("deepseek"):
+        return "DEEPSEEK_API_KEY"
+    if lower.startswith("kimi"):
+        return "KIMI_API_KEY"
+    return "OPENAI_API_KEY"
+
+
+def build_agentv4_env(
+    base_env: dict[str, str],
+    *,
+    model: str,
+    api_base: str,
+    api_key_env: str | None,
+    allow_insecure_tls: bool,
+) -> dict[str, str]:
+    env = base_env.copy()
+    selected_key_name = agentv4_api_key_env_for_model(model, api_key_env)
+    selected_key = env.get(selected_key_name) or env.get("OPENAI_API_KEY") or env.get("TOKENHUB_API_KEY")
+    if selected_key:
+        env["OPENAI_API_KEY"] = selected_key
+        env["TOKENHUB_API_KEY"] = selected_key
+    env["OPENAI_BASE_URL"] = api_base
+    env["OPENAI_API_BASE"] = api_base
+    env.setdefault("npm_config_strict_ssl", "false")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("AGENT_BROWSER_HEADED", "0")
+    env.setdefault("BROWSER_HEADLESS", "1")
+    env.setdefault("PLAYWRIGHT_HEADLESS", "1")
+    env.setdefault("AGENT_BROWSER_HEADLESS", "1")
+    if allow_insecure_tls:
+        env["NODE_TLS_REJECT_UNAUTHORIZED"] = "0"
+    return env
+
+
+def write_agentv4_settings(agentv4_path: Path, *, model: str, api_base: str) -> None:
+    settings_path = agentv4_path / ".harness" / "settings.local.json"
+    settings = load_json(settings_path) if settings_path.is_file() else {}
+    llm = settings.setdefault("llm", {})
+    llm["provider"] = "openai-compatible"
+    llm["baseURL"] = api_base.rstrip("/")
+    llm["model"] = model
+    write_json(settings_path, settings)
+
+
+def update_agentv4_agent_model(agentv4_path: Path, agent_id: str, model: str, *, disable_thinking: bool) -> bool:
+    agent_path = agentv4_path / ".harness" / "agents" / f"{agent_id}.md"
+    if not agent_path.is_file():
+        return False
+    text = agent_path.read_text(encoding="utf-8")
+    updated = re.sub(r"(?m)^model:\s*.+$", f"model: {model}", text, count=1)
+    if disable_thinking:
+        updated = re.sub(r"(?m)^thinking(?:BudgetTokens|Display|Effort)?:\s*.+\r?\n", "", updated)
+    if updated != text:
+        agent_path.write_text(updated, encoding="utf-8")
+    return updated != text
+
+
+def ensure_agentv4_powershell_auto_screenshot(agentv4_path: Path) -> bool:
+    runner_path = agentv4_path / "packages" / "core" / "src" / "application" / "runtime" / "AgentRunner.ts"
+    if not runner_path.is_file():
+        return False
+    text = runner_path.read_text(encoding="utf-8")
+    if "execution.toolName !== 'PowerShell'" in text:
+        return False
+    needle = "if (execution === undefined || execution.toolName !== 'Bash') return content"
+    replacement = (
+        "if (\n"
+        "      execution === undefined ||\n"
+        "      (execution.toolName !== 'Bash' && execution.toolName !== 'PowerShell')\n"
+        "    ) return content"
+    )
+    if needle not in text:
+        return False
+    runner_path.write_text(text.replace(needle, replacement, 1), encoding="utf-8")
+    return True
+
+
+def prepare_agentv4_runtime(
+    agentv4_path: Path,
+    *,
+    agent_id: str,
+    model: str,
+    api_base: str,
+    auto_patch: bool,
+) -> dict[str, Any]:
+    health = agentv4_health(agentv4_path)
+    if not health["ready"]:
+        raise SystemExit(
+            "AgentV4 browser-gui runner is not ready. "
+            f"Blocking checks: {health.get('blocking')}"
+        )
+    changes = {
+        "settings_local_json": str(agentv4_path / ".harness" / "settings.local.json"),
+        "provider": "openai-compatible",
+        "api_base": api_base.rstrip("/"),
+        "model": model,
+        "agent_model_updated": False,
+        "agent_thinking_disabled": not model.lower().startswith("claude"),
+        "powershell_auto_screenshot_patch_applied": False,
+    }
+    if auto_patch:
+        write_agentv4_settings(agentv4_path, model=model, api_base=api_base)
+        changes["agent_model_updated"] = update_agentv4_agent_model(
+            agentv4_path,
+            agent_id,
+            model,
+            disable_thinking=bool(changes["agent_thinking_disabled"]),
+        )
+        changes["powershell_auto_screenshot_patch_applied"] = ensure_agentv4_powershell_auto_screenshot(agentv4_path)
+    return changes
+
+
+def agentv4_runs_dir(result_dir: Path, model: str, domain: str) -> Path:
+    return result_dir / "pyautogui" / "screenshot" / str(model) / domain
+
+
+def safe_file_part(value: str, limit: int = 120) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value)).strip("-")
+    return (cleaned or "item")[:limit]
+
+
+def build_agentv4_task_prompt(task: dict[str, Any], *, max_steps: int, preopen_website: bool) -> str:
+    task_id = task.get("task_id") or task.get("id") or "unknown"
+    website = task.get("website") or task.get("url") or task.get("web") or "about:blank"
+    confirmed_task = task.get("confirmed_task") or task.get("task") or task.get("annotation") or ""
+    start_instruction = (
+        f"Start by opening the website URL with .harness/bin/agent-browser open {website}."
+        if preopen_website
+        else "Start from the website URL in the task."
+    )
+    return " ".join([
+        "Use the agent-browser GUI skill.",
+        "Run this Odysseys browser task using screenshot-only visual policy.",
+        f"Dataset item: task_id={task_id}; website={website}; confirmed_task={confirmed_task}",
+        f"Use at most {max_steps} browser action steps before giving your final answer.",
+        "The runtime fixes automatic screenshots to 1280x720 at device scale factor 1; use absolute pixel bounding boxes x1,y1,x2,y2 in the newest screenshot frame.",
+        "Do not output point-only x,y coordinates for GUI target actions.",
+        start_instruction,
+        "Do not use read/snapshot/DOM/text extraction; rely on runtime screenshots after each browser action.",
+        "Execute GUI actions with bbox coordinates through .harness/bin/agent-browser.",
+        "When completed, answer concisely with the completed result, or report why completion was blocked.",
+    ])
+
+
+def run_agent_browser_close(agentv4_path: Path, env: dict[str, str]) -> None:
+    vendor = agentv4_path / "vendor" / "agent-browser" / "bin" / "agent-browser.js"
+    command = ["node", str(vendor), "close", "--all"] if vendor.is_file() else ["bash", "-lc", ".harness/bin/agent-browser close --all"]
+    run_capture_with_timeout(command, cwd=agentv4_path, env=env, timeout_seconds=30)
+
+
+def run_agentv4_cli_task(
+    *,
+    agentv4_path: Path,
+    agent_id: str,
+    task: dict[str, Any],
+    task_index: int,
+    raw_dir: Path,
+    env: dict[str, str],
+    max_steps: int,
+    task_timeout_ms: int,
+    preopen_website: bool,
+) -> dict[str, Any]:
+    task_id = str(task.get("task_id") or task.get("id") or f"task-{task_index}")
+    run_dir = raw_dir / f"task{task_index:03d}-{safe_file_part(task_id, 96)}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    session_file = run_dir / "session-id.txt"
+    stdout_path = run_dir / "stdout.log"
+    stderr_path = run_dir / "stderr.log"
+    session_file.unlink(missing_ok=True)
+    prompt = build_agentv4_task_prompt(task, max_steps=max_steps, preopen_website=preopen_website)
+    bun_args = [
+        "npx",
+        "--yes",
+        "bun",
+        "packages/pilot/cli/src/bin.ts",
+        "--workspace",
+        str(agentv4_path),
+        "--agent",
+        agent_id,
+        "--bypass",
+        "--debug",
+        "--no-colors",
+        "--session-id-file",
+        str(session_file),
+        "-p",
+        prompt,
+    ]
+    command = ["cmd.exe", "/c", *bun_args] if os.name == "nt" else bun_args
+    started = datetime.now(timezone.utc)
+    exit_code, stdout, stderr, error = run_capture_with_timeout(
+        command,
+        cwd=agentv4_path,
+        env=env,
+        timeout_seconds=task_timeout_ms / 1000 if task_timeout_ms > 0 else None,
+    )
+    signal = "timeout" if exit_code == 124 else None
+    ended = datetime.now(timezone.utc)
+    stdout_path.write_text(stdout, encoding="utf-8", errors="replace")
+    stderr_path.write_text(stderr, encoding="utf-8", errors="replace")
+    session_id = session_file.read_text(encoding="utf-8", errors="replace").strip() if session_file.is_file() else None
+    summary = {
+        "task_index": task_index,
+        "task_id": task_id,
+        "status": "finished" if exit_code == 0 else "failed",
+        "exit_code": exit_code,
+        "signal": signal,
+        "error": error,
+        "session_id": session_id,
+        "started_at": started.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "ended_at": ended.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "duration_seconds": round((ended - started).total_seconds(), 3),
+        "raw_run_dir": str(run_dir),
+        "stdout": str(stdout_path),
+        "stderr": str(stderr_path),
+        "transcript": str(agentv4_path / ".harness" / "sessions" / str(session_id) / "transcript.jsonl") if session_id else None,
+        "final_text_preview": stdout.strip().replace("\n", " ")[-800:],
+    }
+    write_json(run_dir / "result.json", summary)
+    return summary
+
+
+def iter_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not path.is_file():
+        return rows
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                rows.append(value)
+    return rows
+
+
+def transcript_message_content(row: dict[str, Any]) -> list[dict[str, Any]]:
+    message = row.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    return content if isinstance(content, list) else []
+
+
+def visible_text_from_content(content: list[dict[str, Any]]) -> str:
+    parts = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = str(block.get("text") or "").strip()
+            if text and not text.startswith("[auto screenshot attached"):
+                parts.append(text)
+    return "\n".join(parts).strip()
+
+
+def tool_uses_from_content(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [block for block in content if isinstance(block, dict) and block.get("type") == "tool_use"]
+
+
+def tool_results_from_content(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [block for block in content if isinstance(block, dict) and block.get("type") == "tool_result"]
+
+
+def command_from_tool_use(block: dict[str, Any]) -> str | None:
+    if block.get("name") not in ("Bash", "PowerShell"):
+        return None
+    payload = block.get("input")
+    if not isinstance(payload, dict):
+        return None
+    command = payload.get("command")
+    return str(command).strip() if command else None
+
+
+def is_agent_browser_command(command: str | None) -> bool:
+    return bool(command and "agent-browser" in command)
+
+
+def decode_first_image_from_tool_result(result_block: dict[str, Any], output_path: Path) -> str | None:
+    content = result_block.get("content")
+    if not isinstance(content, list):
+        return None
+    for item in content:
+        if not isinstance(item, dict) or item.get("type") != "image":
+            continue
+        source = item.get("source")
+        if not isinstance(source, dict) or source.get("kind") != "base64":
+            continue
+        data = source.get("data")
+        if not isinstance(data, str) or not data:
+            continue
+        output_path.write_bytes(base64.b64decode(data))
+        return output_path.name
+    return None
+
+
+def copy_agentv4_auto_screenshot(agentv4_path: Path, session_id: str | None, tool_use_id: str, output_path: Path) -> str | None:
+    if not session_id or not tool_use_id:
+        return None
+    auto_dir = agentv4_path / ".harness" / "artifacts" / "auto-screenshots"
+    if not auto_dir.is_dir():
+        return None
+    candidates = sorted(auto_dir.glob(f"{safe_file_part(session_id)}-{safe_file_part(tool_use_id)}*.png"))
+    if not candidates:
+        candidates = sorted(auto_dir.glob(f"*{safe_file_part(tool_use_id)}*.png"))
+    if not candidates:
+        return None
+    shutil.copyfile(candidates[-1], output_path)
+    return output_path.name
+
+
+def capture_agentv4_fallback_screenshot(agentv4_path: Path, output_path: Path, env: dict[str, str] | None) -> str | None:
+    vendor = agentv4_path / "vendor" / "agent-browser" / "bin" / "agent-browser.js"
+    if not vendor.is_file():
+        return None
+    run_capture_with_timeout(
+        ["node", str(vendor), "screenshot", str(output_path)],
+        cwd=agentv4_path,
+        env=env,
+        timeout_seconds=15,
+    )
+    return output_path.name if output_path.is_file() else None
+
+
+def convert_agentv4_session_to_trajectory(
+    *,
+    agentv4_path: Path,
+    task_id: str,
+    session_id: str | None,
+    raw_summary: dict[str, Any],
+    output_dir: Path,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    transcript_path = agentv4_path / ".harness" / "sessions" / str(session_id) / "transcript.jsonl" if session_id else None
+    rows = iter_jsonl(transcript_path) if transcript_path else []
+    pending: dict[str, dict[str, Any]] = {}
+    step_num = 0
+    trajectory_rows = []
+    final_text = str(raw_summary.get("final_text_preview") or "").strip()
+
+    for row in rows:
+        message = row.get("message")
+        role = message.get("role") if isinstance(message, dict) else None
+        content = transcript_message_content(row)
+        if role == "assistant":
+            text = visible_text_from_content(content)
+            if text:
+                final_text = text
+            for block in tool_uses_from_content(content):
+                command = command_from_tool_use(block)
+                if is_agent_browser_command(command):
+                    pending[str(block.get("id"))] = {"command": command, "tool": block.get("name")}
+            continue
+        if role != "user":
+            continue
+        for result_block in tool_results_from_content(content):
+            tool_use_id = str(result_block.get("toolUseId") or result_block.get("tool_use_id") or "")
+            tool_use = pending.pop(tool_use_id, None)
+            if not tool_use:
+                continue
+            step_num += 1
+            screenshot_path = output_dir / f"step_{step_num}.png"
+            screenshot_name = decode_first_image_from_tool_result(result_block, screenshot_path)
+            if not screenshot_name:
+                screenshot_name = copy_agentv4_auto_screenshot(agentv4_path, session_id, tool_use_id, screenshot_path)
+            if not screenshot_name:
+                screenshot_name = capture_agentv4_fallback_screenshot(agentv4_path, screenshot_path, env)
+            text = visible_text_from_content(result_block.get("content") if isinstance(result_block.get("content"), list) else [])
+            trajectory_rows.append({
+                "step_num": step_num,
+                "response": "",
+                "action": {
+                    "tool": tool_use.get("tool"),
+                    "command": tool_use.get("command"),
+                    "tool_use_id": tool_use_id,
+                },
+                "action_line": str(tool_use.get("command") or ""),
+                "screenshot": screenshot_name or "",
+                "screenshot_file": screenshot_name or "",
+                "tool_result": text,
+            })
+
+    if final_text:
+        step_num += 1
+        trajectory_rows.append({
+            "step_num": step_num,
+            "response": final_text,
+            "action": {"tool": "assistant_final", "command": ""},
+            "action_line": "",
+            "screenshot": "",
+            "screenshot_file": "",
+            "final": True,
+        })
+
+    traj_path = output_dir / "traj.jsonl"
+    with traj_path.open("w", encoding="utf-8") as f:
+        for item in trajectory_rows:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    (output_dir / "runtime.log").write_text(
+        "\n".join([
+            f"task_id={task_id}",
+            f"session_id={session_id or ''}",
+            f"status={raw_summary.get('status')}",
+            f"exit_code={raw_summary.get('exit_code')}",
+            f"duration_seconds={raw_summary.get('duration_seconds')}",
+            f"transcript={transcript_path or ''}",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    (output_dir / "result.txt").write_text("0\n", encoding="utf-8")
+    write_json(output_dir / "agentv4_result.json", raw_summary)
+    return {
+        "task_id": task_id,
+        "session_id": session_id,
+        "run_dir": str(output_dir),
+        "traj": str(traj_path),
+        "steps": len(trajectory_rows),
+        "screenshots": len(list(output_dir.glob("step_*.png"))),
+        "status": "converted" if trajectory_rows else "empty",
+    }
 
 
 def resolve_repo_path(path: Path | None) -> Path | None:
@@ -720,6 +1197,162 @@ def cmd_run_osworld(args: argparse.Namespace) -> int:
     return completed.returncode
 
 
+def cmd_run_agentv4(args: argparse.Namespace) -> int:
+    env_file = args.env_file or (REPO_ROOT / ".env")
+    load_dotenv_file(env_file)
+    agentv4_path = resolve_repo_path(args.agentv4_path).resolve()
+    prepared_dir = args.prepared_dir if args.prepared_dir.is_absolute() else (REPO_ROOT / args.prepared_dir)
+    prepared_dir = prepared_dir.resolve()
+    selected_tasks_path = args.task_source_json or (prepared_dir / "selected_tasks.json")
+    selected_tasks_path = selected_tasks_path if selected_tasks_path.is_absolute() else (REPO_ROOT / selected_tasks_path)
+    selected_tasks_path = selected_tasks_path.resolve()
+    if not selected_tasks_path.is_file():
+        raise SystemExit(f"Prepared task source missing: {selected_tasks_path}")
+    tasks = load_json(selected_tasks_path)
+    if not isinstance(tasks, list) or not tasks:
+        raise SystemExit(f"No tasks found in: {selected_tasks_path}")
+    if args.limit is not None:
+        tasks = tasks[:args.limit]
+
+    result_dir = args.result_dir if args.result_dir.is_absolute() else (REPO_ROOT / args.result_dir)
+    result_dir = result_dir.resolve()
+    result_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir = result_dir / "agentv4_raw"
+    trajectories_dir = agentv4_runs_dir(result_dir, args.model, args.domain)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    trajectories_dir.mkdir(parents=True, exist_ok=True)
+    console_log = result_dir / "run_console.log"
+    manifest_path = result_dir / "run_manifest.json"
+    report_output = resolve_repo_path(args.report_output)
+    api_base = (args.api_base or os.getenv("OPENAI_BASE_URL") or os.getenv("OPENAI_API_BASE") or "https://tokenhub.sensetime.com/v1").rstrip("/")
+    api_key_env = agentv4_api_key_env_for_model(args.model, args.api_key_env)
+    selected_key = os.getenv(api_key_env) or os.getenv("OPENAI_API_KEY") or os.getenv("TOKENHUB_API_KEY")
+    if not selected_key:
+        raise SystemExit(f"API key is not set for AgentV4 model={args.model}; expected {api_key_env} or OPENAI_API_KEY.")
+
+    runtime_changes = prepare_agentv4_runtime(
+        agentv4_path,
+        agent_id=args.agent_id,
+        model=args.model,
+        api_base=api_base,
+        auto_patch=args.auto_patch_agentv4,
+    )
+    env = build_agentv4_env(
+        os.environ,
+        model=args.model,
+        api_base=api_base,
+        api_key_env=api_key_env,
+        allow_insecure_tls=args.allow_insecure_tokenhub_tls,
+    )
+
+    started = datetime.now(timezone.utc)
+    manifest = {
+        "schema_version": 1,
+        "status": "running",
+        "agent_backend": "agentv4",
+        "model": args.model,
+        "max_steps": args.max_steps,
+        "prepared_subset": str(prepared_dir),
+        "task_source_json": str(selected_tasks_path),
+        "result_dir": str(result_dir),
+        "score_runs_dir": str(trajectories_dir),
+        "agentv4_path": str(agentv4_path),
+        "agentv4_agent_id": args.agent_id,
+        "domain": args.domain,
+        "api_base": api_base,
+        "api_key_env": api_key_env,
+        "env_provider": infer_env_provider(args.model),
+        "env_flags": {
+            "NODE_TLS_REJECT_UNAUTHORIZED": env.get("NODE_TLS_REJECT_UNAUTHORIZED"),
+            "npm_config_strict_ssl": env.get("npm_config_strict_ssl"),
+            "PYTHONIOENCODING": env.get("PYTHONIOENCODING"),
+            "BROWSER_HEADLESS": env.get("BROWSER_HEADLESS"),
+            "PLAYWRIGHT_HEADLESS": env.get("PLAYWRIGHT_HEADLESS"),
+        },
+        "runtime_changes": runtime_changes,
+        "start_time": started.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "end_time": None,
+        "duration_seconds": None,
+        "exit_code": None,
+        "console_log": str(console_log),
+        "git": {
+            "odysseys": git_info(REPO_ROOT),
+            "agentv4": git_info(agentv4_path),
+        },
+    }
+    manifest.update(expected_tasks_from_prepared(prepared_dir))
+    write_json(manifest_path, manifest)
+
+    print(f"Running AgentV4: {result_dir}")
+    print(f"Manifest: {manifest_path}")
+    summaries = []
+    conversions = []
+    with console_log.open("w", encoding="utf-8", errors="replace") as log:
+        for index, task in enumerate(tasks):
+            task_id = str(task.get("task_id") or task.get("id") or f"task-{index}")
+            line = f"\n=== AgentV4 task {index + 1}/{len(tasks)}: {task_id} ===\n"
+            print(line.strip())
+            log.write(line)
+            if args.close_browsers_each_task:
+                run_agent_browser_close(agentv4_path, env)
+            summary = run_agentv4_cli_task(
+                agentv4_path=agentv4_path,
+                agent_id=args.agent_id,
+                task=task,
+                task_index=index,
+                raw_dir=raw_dir,
+                env=env,
+                max_steps=args.max_steps,
+                task_timeout_ms=args.task_timeout_ms,
+                preopen_website=args.preopen_website,
+            )
+            summaries.append(summary)
+            log.write(json.dumps(summary, ensure_ascii=False) + "\n")
+            task_out_dir = trajectories_dir / task_id
+            if task_out_dir.exists():
+                shutil.rmtree(task_out_dir)
+            conversion = convert_agentv4_session_to_trajectory(
+                agentv4_path=agentv4_path,
+                task_id=task_id,
+                session_id=summary.get("session_id"),
+                raw_summary=summary,
+                output_dir=task_out_dir,
+                env=env,
+            )
+            conversions.append(conversion)
+            log.write(json.dumps(conversion, ensure_ascii=False) + "\n")
+            print(f"  exit={summary['exit_code']} session={summary.get('session_id')} steps={conversion['steps']} screenshots={conversion['screenshots']}")
+        if args.close_browsers_each_task:
+            run_agent_browser_close(agentv4_path, env)
+
+    ended = datetime.now(timezone.utc)
+    write_json(raw_dir / "summary.json", summaries)
+    write_json(result_dir / "agentv4_conversions.json", conversions)
+    failed = [item for item in summaries if item.get("exit_code") != 0]
+    empty = [item for item in conversions if not item.get("steps")]
+    manifest["status"] = "success" if not failed and not empty else ("partial" if conversions else "failed")
+    manifest["end_time"] = ended.isoformat(timespec="seconds").replace("+00:00", "Z")
+    manifest["duration_seconds"] = round((ended - started).total_seconds(), 3)
+    manifest["exit_code"] = 0 if not failed else 1
+    manifest["agentv4_failed_tasks"] = len(failed)
+    manifest["empty_trajectories"] = len(empty)
+    manifest.update(completion_from_runs(result_dir))
+    write_json(manifest_path, manifest)
+
+    print(f"AgentV4 duration_seconds={manifest['duration_seconds']}, failed_tasks={len(failed)}, empty_trajectories={len(empty)}")
+    print(f"Console log: {console_log}")
+    if args.write_report:
+        report_output = report_output or (REPO_ROOT / "outputs" / "reports" / f"{result_dir.name}_report.json")
+        report_args = argparse.Namespace(
+            runs_dir=result_dir,
+            console_log=console_log,
+            output=report_output,
+            csv_output=report_output.with_suffix(".csv"),
+        )
+        cmd_smoke_report(report_args)
+    return int(manifest["exit_code"])
+
+
 def cmd_finalize_run(args: argparse.Namespace) -> int:
     result_dir = resolve_repo_path(args.result_dir).resolve()
     prepared_dir = resolve_repo_path(args.prepared_dir)
@@ -804,6 +1437,10 @@ def cmd_smoke_report(args: argparse.Namespace) -> int:
     console_text = read_text_auto(args.console_log) if args.console_log and args.console_log.is_file() else ""
     console_usage = extract_usage(console_text)
     console_duration = extract_console_duration_seconds(console_text)
+    if console_duration is None and (runs_dir / "run_manifest.json").is_file():
+        manifest_duration = load_json(runs_dir / "run_manifest.json").get("duration_seconds")
+        if isinstance(manifest_duration, (int, float)):
+            console_duration = round(float(manifest_duration), 3)
     console_error_mentions = len(re.findall(r"ERROR|Traceback|SyntaxError|Command executed failed|returncode\":\s*[1-9]", console_text))
     summary_path = runs_dir / "summary" / "results.json"
     summary_rows = load_json(summary_path) if summary_path.is_file() else []
@@ -1089,17 +1726,72 @@ def cmd_run_suite(args: argparse.Namespace) -> int:
         return 0
 
     if agent_backend == "agentv4":
-        health = agentv4_health(agentv4_path)
-        if not health["ready"]:
-            print(json.dumps(health, indent=2, ensure_ascii=False))
-            raise SystemExit(
-                "AgentV4 browser-gui runner is not ready. "
-                "Fix the blocking checks above before running the suite."
-            )
-        raise SystemExit(
-            "AgentV4 runner selection is wired, but trajectory conversion is not enabled yet. "
-            "Next step: convert .harness session transcripts/auto-screenshots into scorer-compatible traj.jsonl."
+        run_args = argparse.Namespace(
+            prepared_dir=prepared_dir,
+            result_dir=result_dir,
+            task_source_json=task_source_json,
+            agentv4_path=agentv4_path,
+            agent_id=agentv4.get("agent_id", "browser-gui"),
+            model=str(agent_model),
+            max_steps=max_steps,
+            domain=domain,
+            env_file=args.env_file,
+            api_base=model_cfg.get("api_base") or config.get("api_base", "https://tokenhub.sensetime.com/v1"),
+            api_key_env=model_cfg.get("api_key_env"),
+            task_timeout_ms=int(model_cfg.get("task_timeout_ms") or agentv4.get("task_timeout_ms", 1_800_000)),
+            preopen_website=bool(agentv4.get("preopen_website", True)),
+            close_browsers_each_task=bool(agentv4.get("close_browsers_each_task", True)),
+            allow_insecure_tokenhub_tls=bool(agentv4.get("allow_insecure_tokenhub_tls", True)),
+            auto_patch_agentv4=bool(agentv4.get("auto_patch_agentv4", True)),
+            limit=None,
+            write_report=True,
+            report_output=runner_report,
         )
+        run_code = cmd_run_agentv4(run_args)
+
+        finalize_args = argparse.Namespace(
+            result_dir=result_dir,
+            prepared_dir=prepared_dir,
+            manifest=None,
+            exit_code=run_code,
+            status=None,
+            write_report=True,
+            write_csv=True,
+            console_log=None,
+            report_output=runner_report,
+        )
+        cmd_finalize_run(finalize_args)
+        if run_code != 0 and not args.continue_on_runner_error:
+            return run_code
+
+        score_args = argparse.Namespace(
+            runs_dir=score_runs_dir,
+            task_source_json=task_source_json,
+            output=score_output,
+            model=plan["judge_model"],
+            num_workers=int(args.judge_num_workers or judge.get("num_workers", 1)),
+            max_images=int(judge.get("max_images", 0)),
+            max_steps=int(judge.get("max_steps", 100)),
+            include_incomplete=bool(judge.get("include_incomplete", False)),
+            api_base=args.api_base or judge.get("api_base") or config.get("api_base"),
+            env_file=args.env_file,
+            use_curl_openai=bool(judge.get("use_curl_openai", True)),
+            manifest_output=None,
+            csv_output=score_csv,
+        )
+        score_code = cmd_score(score_args)
+        if score_code != 0:
+            return score_code
+
+        merge_args = argparse.Namespace(
+            runner_report=runner_report,
+            score_results=score_output,
+            task_source_json=task_source_json,
+            output=merged_output,
+            csv_output=merged_csv,
+            model=str(agent_model),
+        )
+        return cmd_merge_report(merge_args)
 
     if agent_backend != "osworld":
         raise SystemExit(f"Unsupported agent backend: {agent_backend}")
@@ -1270,6 +1962,28 @@ def build_parser() -> argparse.ArgumentParser:
     run_osworld.add_argument("--write-report", action=argparse.BooleanOptionalAction, default=True)
     run_osworld.add_argument("--report-output", type=Path, default=None)
     run_osworld.set_defaults(func=cmd_run_osworld)
+
+    run_agentv4 = sub.add_parser("run-agentv4", help="Run AgentV4 browser-gui on a prepared Odysseys subset and adapt transcripts into scorer-compatible trajectories.")
+    run_agentv4.add_argument("--prepared-dir", type=Path, required=True)
+    run_agentv4.add_argument("--result-dir", type=Path, required=True)
+    run_agentv4.add_argument("--task-source-json", type=Path, default=None, help="Defaults to <prepared-dir>/selected_tasks.json.")
+    run_agentv4.add_argument("--agentv4-path", type=Path, default=DEFAULT_AGENTV4_PATH)
+    run_agentv4.add_argument("--agent-id", default="browser-gui")
+    run_agentv4.add_argument("--model", default="claude-opus-4-7-thinking")
+    run_agentv4.add_argument("--max-steps", type=int, default=30)
+    run_agentv4.add_argument("--domain", default="mind2web_chrome")
+    run_agentv4.add_argument("--env-file", type=Path, default=None)
+    run_agentv4.add_argument("--api-base", default="https://tokenhub.sensetime.com/v1")
+    run_agentv4.add_argument("--api-key-env", default=None, help="Override key env name used for the model; never written to manifests.")
+    run_agentv4.add_argument("--task-timeout-ms", type=int, default=1_800_000)
+    run_agentv4.add_argument("--preopen-website", action=argparse.BooleanOptionalAction, default=True)
+    run_agentv4.add_argument("--close-browsers-each-task", action=argparse.BooleanOptionalAction, default=True)
+    run_agentv4.add_argument("--allow-insecure-tokenhub-tls", action=argparse.BooleanOptionalAction, default=True)
+    run_agentv4.add_argument("--auto-patch-agentv4", action=argparse.BooleanOptionalAction, default=True)
+    run_agentv4.add_argument("--limit", type=int, default=None, help="Run only the first N prepared tasks for smoke testing.")
+    run_agentv4.add_argument("--write-report", action=argparse.BooleanOptionalAction, default=True)
+    run_agentv4.add_argument("--report-output", type=Path, default=None)
+    run_agentv4.set_defaults(func=cmd_run_agentv4)
 
     finalize = sub.add_parser("finalize-run", help="Repair/finalize a run manifest and optionally regenerate the runner report.")
     finalize.add_argument("--result-dir", type=Path, required=True)

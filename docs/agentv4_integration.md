@@ -67,18 +67,50 @@ Working pieces:
   `agentv4-agent-browser-skill-framework/vendor/agent-browser/bin/`.
 - `agent-browser` itself can launch Chrome and take screenshots.
 - A `pnpm-workspace.yaml` was added so pnpm can install workspace dependencies.
+- `packages/sdk/src/sessions/` has been restored.
+- `browser-gui` can run through the AgentV4 CLI and call `.harness/bin/agent-browser`.
+- AgentV4 transcripts can be adapted into scorer-compatible `traj.jsonl`,
+  `step_*.png`, and `result.txt` directories.
+- A 1-task `gpt-5.6-luna` smoke verified `run-agentv4 -> score -> merge-report`.
 
-Blocking issue:
+Local runtime constraints:
 
-- `packages/sdk/src/index.ts` imports `./sessions/index.ts`, but
-  `packages/sdk/src/sessions/` is missing from the provided directory.
-- Because of that missing source directory, the AgentV4 harness CLI cannot
-  start `browser-gui` yet.
+- TokenHub is used through the AgentV4 `openai-compatible` provider at
+  `https://tokenhub.sensetime.com/v1`.
+- On this Windows machine, Node/fetch reports `unable to verify the first
+  certificate` for TokenHub. The local runner therefore sets
+  `NODE_TLS_REJECT_UNAUTHORIZED=0` for AgentV4 subprocesses only.
+- For non-Claude OpenAI-compatible models, the runner removes AgentV4
+  frontmatter `thinking*` fields from the local ignored `browser-gui.md`,
+  because TokenHub returns `Unknown parameter: 'thinking'` for models such as
+  `gpt-5.6-luna`.
+- Windows AgentV4 exposes browser commands through the `PowerShell` tool, so
+  the local runner auto-patches AgentV4's auto-screenshot gate to accept both
+  `Bash` and `PowerShell`.
 
-This is currently not an `agent-harness-core` missing-package problem. The core
-package exists; the missing SDK sessions source is the active blocker.
+Run a one-task AgentV4 smoke:
 
-Once the missing `packages/sdk/src/sessions/` source is restored, the next
-adapter step is to convert AgentV4 session transcripts and
-`.harness/artifacts/auto-screenshots/*.png` into scorer-compatible
-`traj.jsonl`, `step_*.png`, and `result.txt` run directories.
+```powershell
+python -m odysseys_eval run-agentv4 `
+  --prepared-dir outputs\dev_10 `
+  --result-dir outputs\agentv4_smoke_adapter_gpt56luna `
+  --model gpt-5.6-luna `
+  --max-steps 1 `
+  --limit 1 `
+  --task-timeout-ms 90000
+```
+
+Run one configured model through the full local suite:
+
+```powershell
+python -m odysseys_eval run-suite `
+  --config configs\dev_10_models.example.json `
+  --model gpt-5.6-luna `
+  --agent-backend agentv4
+```
+
+The adapted scorer input is written under:
+
+```text
+outputs/runs_<suite>_<model_slug>/pyautogui/screenshot/<model>/<domain>/<task_id>/
+```

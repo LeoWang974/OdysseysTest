@@ -228,8 +228,20 @@ python -m odysseys_eval run-suite \
 
 For local runs, use `--dry-run` first to print the resolved paths and model
 settings without starting the browser/VM.
-`run-suite` starts a real OSWorld run; use `merge-report` instead when you only
-want to recombine existing runner and judge artifacts.
+`run-suite` starts the configured backend (`osworld` or `agentv4`); use
+`merge-report` instead when you only want to recombine existing runner and judge
+artifacts.
+
+AgentV4 can also be smoke-tested directly before a full suite:
+
+```bash
+python -m odysseys_eval run-agentv4 \
+  --prepared-dir outputs/dev_10 \
+  --result-dir outputs/agentv4_smoke_adapter_gpt56luna \
+  --model gpt-5.6-luna \
+  --max-steps 1 \
+  --limit 1
+```
 
 We report two metrics per task. Averaged is the mean rubric score. Perfect is 1 if and only if every rubric is satisfied.
 

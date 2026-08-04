@@ -24,7 +24,9 @@
     "runner_script": ".harness/scripts/run-online-mind2web-harness-batch.mjs",
     "task_timeout_ms": 1800000,
     "preopen_website": true,
-    "close_browsers_each_task": true
+    "close_browsers_each_task": true,
+    "allow_insecure_tokenhub_tls": true,
+    "auto_patch_agentv4": true
   },
   "judge": {
     "model": "gpt-5.5",

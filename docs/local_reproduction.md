@@ -171,6 +171,33 @@ Runner report fields include:
 - trajectory errors
 - runtime and console error counters
 
+## AgentV4 Runner
+
+AgentV4 runs use the same `outputs\dev_10\selected_tasks.json` task ids and
+the same downstream rubric judge. The local runner prepares the ignored
+`agentv4-agent-browser-skill-framework/` directory for TokenHub, runs the
+`browser-gui` CLI, and adapts AgentV4 transcripts into the OSWorld-like scorer
+layout:
+
+```text
+<result_dir>\pyautogui\screenshot\<model>\mind2web_chrome\<task_id>\
+```
+
+Run a 1-task smoke:
+
+```powershell
+python -m odysseys_eval run-agentv4 `
+  --prepared-dir outputs\dev_10 `
+  --result-dir outputs\agentv4_smoke_adapter_gpt56luna `
+  --model gpt-5.6-luna `
+  --max-steps 1 `
+  --limit 1
+```
+
+For TokenHub on this Windows machine, AgentV4 subprocesses set
+`NODE_TLS_REJECT_UNAUTHORIZED=0` and use the OpenAI-compatible endpoint. The
+manifest records these flags but never records API key values.
+
 ## Rubric Judge
 
 For OpenAI-compatible judging through tokenhub:
