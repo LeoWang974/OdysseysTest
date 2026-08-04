@@ -4,6 +4,9 @@
 !.env.example
 configs/*.local.json
 
+# Local external agent framework checkout/drop-in.
+agentv4-agent-browser-skill-framework/
+
 # Python
 .venv/
 venv/
@@ -16,6 +19,9 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# JavaScript / TypeScript
+node_modules/
 
 # Evaluation outputs and logs
 outputs/

@@ -134,8 +134,9 @@ python -m odysseys_eval run-osworld `
 ```
 
 The local Windows run completed 10/10 trajectories and consumed about 1.87M
-tokens over about 2h43m. Server runs should be launched inside `tmux` or
-`screen` to avoid terminal/tool timeout.
+tokens over about 2h43m. Follow-up experiments are run on this local Windows
+machine; use a dedicated PowerShell or Windows Terminal tab for long runs and
+keep Docker Desktop running.
 
 If the outer shell or Codex tool times out but OSWorld keeps running and lands
 artifacts, finalize the run from disk:
@@ -187,8 +188,8 @@ python -m odysseys_eval score `
 ```
 
 `score` writes `outputs\scores\dev_10_gpt55_eval.manifest.json` by default and
-enables the local curl fallback automatically. Pass `--no-use-curl-openai` on a
-server if the standard Python SDK path is stable.
+enables the local curl fallback automatically. Pass `--no-use-curl-openai` only
+if the standard Python SDK path is stable in the current local environment.
 
 Summarize an existing score file:
 
@@ -222,18 +223,84 @@ python -m odysseys_eval merge-report `
 The fixed local baseline is summarized in
 [`docs/baselines/dev_10_gpt55_baseline.md`](baselines/dev_10_gpt55_baseline.md).
 
-## Server Migration Checklist
+## Multi-model dev_10 Runs
 
-1. Push this repository to GitHub.
-2. Clone the repo on the server.
-3. Clone OSWorld on the server and set `OSWORLD_PATH`.
-4. Place the VM image outside the Git repo.
-5. Create `.env` on the server with API keys and base URLs.
-6. Install Python dependencies.
-7. Run `python -m odysseys_eval doctor`.
-8. Run a 1-task smoke trajectory.
-9. Run `dev_10`.
-10. Run rubric judge and collect reports.
+For model comparisons, keep the evaluation surface fixed:
+
+- Same task ids: `outputs\dev_10\selected_tasks.json`
+- Same OSWorld meta: `outputs\dev_10\test_all.json`
+- Same agent step budget: `max_steps=30`
+- Same judge model: `gpt-5.5`
+- Same judge step budget: `max_steps=100`
+- Same judge concurrency by default: `num_workers=1`
+
+The configured test agent backend is now `agentv4`, using
+`agentv4-agent-browser-skill-framework/` and the registered `browser-gui`
+agent. Run the integration doctor first:
+
+```powershell
+python -m odysseys_eval agentv4-doctor
+```
+
+See [`docs/agentv4_integration.md`](agentv4_integration.md) for the directory
+analysis, Windows setup notes, and current readiness checks.
+
+The model matrix lives in
+[`configs/dev_10_models.example.json`](../configs/dev_10_models.example.json).
+It defines the shared subset, judge settings, OSWorld defaults, output
+directories, and model slugs.
+
+Output naming convention:
+
+```text
+outputs\runs_dev_10_<model_slug>\
+outputs\reports\dev_10_<model_slug>_runner_report.json
+outputs\scores\dev_10_<model_slug>_eval.json
+outputs\scores\dev_10_<model_slug>_eval.csv
+outputs\leaderboards\dev_10_<model_slug>_baseline.json
+outputs\leaderboards\dev_10_<model_slug>_baseline.csv
+```
+
+Before launching a long run, inspect the resolved plan:
+
+```powershell
+python -m odysseys_eval run-suite `
+  --config configs\dev_10_models.example.json `
+  --model gpt-5.5 `
+  --env-file .env `
+  --dry-run
+```
+
+Run one model end-to-end:
+
+```powershell
+python -m odysseys_eval run-suite `
+  --config configs\dev_10_models.example.json `
+  --model gpt-5.5 `
+  --env-file .env
+```
+
+`run-suite` executes:
+
+1. `run-osworld`
+2. `finalize-run`
+3. `score`
+4. `merge-report`
+
+For local long runs, launch this command in a dedicated terminal. `run-suite`
+starts a real browser/VM run; use `merge-report` when you only want to recombine
+existing runner and judge artifacts.
+
+## Local Experiment Checklist
+
+1. Keep this repository and OSWorld on the local machine.
+2. Keep the VM image outside the Git repo and set `OSWORLD_VM_PATH`.
+3. Keep API keys in local `.env`; never commit it.
+4. Run `python -m odysseys_eval doctor`.
+5. Run `python -m odysseys_eval agentv4-doctor` before AgentV4 runs.
+6. Start with a 1-task smoke trajectory after any agent/backend change.
+7. Run `dev_10` only after smoke passes.
+8. Run rubric judge, `merge-report`, and inspect the unified table.
 
 ## Known Local Issues
 

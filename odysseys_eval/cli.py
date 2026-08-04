@@ -26,6 +26,7 @@ LOCAL_CHROME_STABILITY_ARGS = [
     "--allow-running-insecure-content",
     "--test-type",
 ]
+DEFAULT_AGENTV4_PATH = REPO_ROOT / "agentv4-agent-browser-skill-framework"
 
 
 def load_json(path: Path) -> Any:
@@ -143,6 +144,19 @@ def has_module(module: str) -> bool:
         return False
 
 
+def command_available(command: str) -> bool:
+    try:
+        completed = subprocess.run(
+            ["where.exe", command] if os.name == "nt" else ["which", command],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        return completed.returncode == 0
+    except Exception:
+        return False
+
+
 def git_info(path: Path) -> dict[str, Any]:
     info: dict[str, Any] = {"path": str(path)}
     try:
@@ -170,6 +184,41 @@ def infer_env_provider(model: str) -> dict[str, str | None]:
     elif model.lower().startswith("gpt"):
         provider = "openai"
     return {"provider": provider, "base_url": base_url}
+
+
+def agentv4_health(agentv4_path: Path) -> dict[str, Any]:
+    vendor_bin = agentv4_path / "vendor" / "agent-browser" / "bin"
+    win_agent_browser = vendor_bin / "agent-browser-win32-x64.exe"
+    health = {
+        "path": str(agentv4_path),
+        "exists": agentv4_path.is_dir(),
+        "package_json": (agentv4_path / "package.json").is_file(),
+        "pnpm_workspace": (agentv4_path / "pnpm-workspace.yaml").is_file(),
+        "node_modules": (agentv4_path / "node_modules").is_dir(),
+        "harness_agent": (agentv4_path / ".harness" / "agents" / "browser-gui.md").is_file(),
+        "harness_skill": (agentv4_path / ".harness" / "skills" / "agent-browser" / "SKILL.md").is_file(),
+        "harness_batch_script": (agentv4_path / ".harness" / "scripts" / "run-online-mind2web-harness-batch.mjs").is_file(),
+        "harness_bin": (agentv4_path / ".harness" / "bin" / "agent-browser").is_file(),
+        "vendor_agent_browser_js": (vendor_bin / "agent-browser.js").is_file(),
+        "vendor_agent_browser_win32": win_agent_browser.is_file(),
+        "sdk_sessions_source": (agentv4_path / "packages" / "sdk" / "src" / "sessions" / "index.ts").is_file(),
+        "node": command_available("node"),
+        "pnpm": command_available("pnpm"),
+        "bun": command_available("bun"),
+    }
+    required = [
+        "exists",
+        "package_json",
+        "harness_agent",
+        "harness_skill",
+        "harness_batch_script",
+        "vendor_agent_browser_js",
+        "vendor_agent_browser_win32",
+        "sdk_sessions_source",
+    ]
+    health["ready"] = all(bool(health[key]) for key in required)
+    health["blocking"] = [key for key in required if not health[key]]
+    return health
 
 
 def resolve_repo_path(path: Path | None) -> Path | None:
@@ -276,6 +325,18 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     print(f"env: OSWORLD_PATH={osworld_path or 'unset'}")
     vm_path = os.getenv("OSWORLD_VM_PATH")
     print(f"env: OSWORLD_VM_PATH={vm_path or 'unset'}")
+    return 0
+
+
+def cmd_agentv4_doctor(args: argparse.Namespace) -> int:
+    agentv4_path = resolve_repo_path(args.agentv4_path).resolve()
+    health = agentv4_health(agentv4_path)
+    print(json.dumps(health, indent=2, ensure_ascii=False))
+    if not health["ready"]:
+        print("AgentV4 browser-gui runner is not ready.")
+        if "sdk_sessions_source" in health["blocking"]:
+            print("Missing source directory: packages/sdk/src/sessions. The harness CLI imports ./sessions/index.ts.")
+        return 1
     return 0
 
 
@@ -841,6 +902,22 @@ def mean(values: list[float]) -> float | None:
     return round(sum(values) / len(values), 6) if values else None
 
 
+def model_slug(value: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "", value).lower()
+    return slug or "model"
+
+
+def select_suite_model(config: dict[str, Any], model_name: str) -> dict[str, Any]:
+    for item in config.get("models", []):
+        if not isinstance(item, dict):
+            continue
+        names = {str(item.get("name", "")), str(item.get("agent_model", "")), str(item.get("slug", ""))}
+        if model_name in names:
+            return item
+    available = [item.get("name") for item in config.get("models", []) if isinstance(item, dict)]
+    raise SystemExit(f"Model not found in suite config: {model_name}. Available: {available}")
+
+
 def cmd_merge_report(args: argparse.Namespace) -> int:
     runner_report = load_json(resolve_repo_path(args.runner_report).resolve())
     score_results = load_json(resolve_repo_path(args.score_results).resolve())
@@ -959,12 +1036,150 @@ def cmd_merge_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_run_suite(args: argparse.Namespace) -> int:
+    config_path = resolve_repo_path(args.config).resolve()
+    config = load_json(config_path)
+    model_cfg = select_suite_model(config, args.model)
+
+    suite_name = args.suite_name or config.get("suite_name", "dev_10")
+    domain = config.get("domain", "mind2web_chrome")
+    prepared_dir = resolve_repo_path(Path(config.get("prepared_dir", f"outputs/{suite_name}"))).resolve()
+    task_source_json = resolve_repo_path(Path(config.get("task_source_json", str(prepared_dir / "selected_tasks.json")))).resolve()
+    reports_dir = resolve_repo_path(Path(config.get("reports_dir", "outputs/reports"))).resolve()
+    scores_dir = resolve_repo_path(Path(config.get("scores_dir", "outputs/scores"))).resolve()
+    leaderboards_dir = resolve_repo_path(Path(config.get("leaderboards_dir", "outputs/leaderboards"))).resolve()
+
+    agent_model = model_cfg.get("agent_model") or model_cfg.get("name") or args.model
+    slug = model_cfg.get("slug") or model_slug(str(agent_model))
+    result_dir = resolve_repo_path(Path(model_cfg.get("result_dir", f"outputs/runs_{suite_name}_{slug}"))).resolve()
+    runner_report = reports_dir / f"{suite_name}_{slug}_runner_report.json"
+    score_output = scores_dir / f"{suite_name}_{slug}_eval.json"
+    score_csv = score_output.with_suffix(".csv")
+    merged_output = leaderboards_dir / f"{suite_name}_{slug}_baseline.json"
+    merged_csv = merged_output.with_suffix(".csv")
+    score_runs_dir = result_dir / "pyautogui" / "screenshot" / str(agent_model) / domain
+
+    max_steps = int(args.max_steps or model_cfg.get("max_steps") or config.get("max_steps", 30))
+    judge = config.get("judge", {})
+    osworld = config.get("osworld", {})
+    agent_backend = args.agent_backend or model_cfg.get("agent_backend") or config.get("agent_backend", "osworld")
+    agentv4 = config.get("agentv4", {})
+    agentv4_path = resolve_repo_path(Path(args.agentv4_path or agentv4.get("path", str(DEFAULT_AGENTV4_PATH)))).resolve()
+
+    plan = {
+        "suite": suite_name,
+        "agent_backend": agent_backend,
+        "model": agent_model,
+        "slug": slug,
+        "prepared_dir": str(prepared_dir),
+        "task_source_json": str(task_source_json),
+        "max_steps": max_steps,
+        "judge_model": args.judge_model or judge.get("model", config.get("judge_model", "gpt-5.5")),
+        "result_dir": str(result_dir),
+        "runner_report": str(runner_report),
+        "score_runs_dir": str(score_runs_dir),
+        "score_output": str(score_output),
+        "merged_output": str(merged_output),
+    }
+    if agent_backend == "agentv4":
+        plan["agentv4_path"] = str(agentv4_path)
+        plan["agentv4_agent_id"] = agentv4.get("agent_id", "browser-gui")
+    print(json.dumps(plan, indent=2, ensure_ascii=False))
+    if args.dry_run:
+        return 0
+
+    if agent_backend == "agentv4":
+        health = agentv4_health(agentv4_path)
+        if not health["ready"]:
+            print(json.dumps(health, indent=2, ensure_ascii=False))
+            raise SystemExit(
+                "AgentV4 browser-gui runner is not ready. "
+                "Fix the blocking checks above before running the suite."
+            )
+        raise SystemExit(
+            "AgentV4 runner selection is wired, but trajectory conversion is not enabled yet. "
+            "Next step: convert .harness session transcripts/auto-screenshots into scorer-compatible traj.jsonl."
+        )
+
+    if agent_backend != "osworld":
+        raise SystemExit(f"Unsupported agent backend: {agent_backend}")
+
+    run_args = argparse.Namespace(
+        prepared_dir=prepared_dir,
+        result_dir=result_dir,
+        osworld_path=args.osworld_path or osworld.get("path"),
+        path_to_vm=args.path_to_vm or osworld.get("path_to_vm"),
+        provider_name=osworld.get("provider_name", "docker"),
+        headless=bool(osworld.get("headless", True)),
+        observation_type=osworld.get("observation_type", "screenshot"),
+        model=str(agent_model),
+        sleep_after_execution=float(osworld.get("sleep_after_execution", 0.0)),
+        max_steps=max_steps,
+        domain=domain,
+        env_file=args.env_file,
+        openai_base_url=model_cfg.get("openai_base_url") or config.get("openai_base_url"),
+        use_curl_openai=bool(model_cfg.get("use_curl_openai", config.get("use_curl_openai", True))),
+        python=args.python,
+        write_report=True,
+        report_output=runner_report,
+    )
+    run_code = cmd_run_osworld(run_args)
+
+    finalize_args = argparse.Namespace(
+        result_dir=result_dir,
+        prepared_dir=prepared_dir,
+        manifest=None,
+        exit_code=run_code,
+        status=None,
+        write_report=True,
+        write_csv=True,
+        console_log=None,
+        report_output=runner_report,
+    )
+    cmd_finalize_run(finalize_args)
+    if run_code != 0 and not args.continue_on_runner_error:
+        return run_code
+
+    score_args = argparse.Namespace(
+        runs_dir=score_runs_dir,
+        task_source_json=task_source_json,
+        output=score_output,
+        model=plan["judge_model"],
+        num_workers=int(args.judge_num_workers or judge.get("num_workers", 1)),
+        max_images=int(judge.get("max_images", 0)),
+        max_steps=int(judge.get("max_steps", 100)),
+        include_incomplete=bool(judge.get("include_incomplete", False)),
+        api_base=args.api_base or judge.get("api_base") or config.get("api_base"),
+        env_file=args.env_file,
+        use_curl_openai=bool(judge.get("use_curl_openai", True)),
+        manifest_output=None,
+        csv_output=score_csv,
+    )
+    score_code = cmd_score(score_args)
+    if score_code != 0:
+        return score_code
+
+    merge_args = argparse.Namespace(
+        runner_report=runner_report,
+        score_results=score_output,
+        task_source_json=task_source_json,
+        output=merged_output,
+        csv_output=merged_csv,
+        model=str(agent_model),
+    )
+    return cmd_merge_report(merge_args)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Local orchestration for Odysseys reproduction runs.")
     sub = parser.add_subparsers(dest="command", required=True)
 
     doctor = sub.add_parser("doctor", help="Check local dataset, scripts, dependencies, and key environment variables.")
     doctor.set_defaults(func=cmd_doctor)
+
+    agentv4_doctor = sub.add_parser("agentv4-doctor", help="Check the local AgentV4 browser-gui framework integration.")
+    agentv4_doctor.add_argument("--agentv4-path", type=Path, default=DEFAULT_AGENTV4_PATH)
+    agentv4_doctor.set_defaults(func=cmd_agentv4_doctor)
 
     prepare = sub.add_parser("prepare", help="Create a selected task subset and OSWorld examples for it.")
     prepare.add_argument("--task-source-json", type=Path, default=DEFAULT_TASKS)
@@ -1083,6 +1298,24 @@ def build_parser() -> argparse.ArgumentParser:
     merge.add_argument("--csv-output", type=Path, default=None)
     merge.add_argument("--model", default=None)
     merge.set_defaults(func=cmd_merge_report)
+
+    suite = sub.add_parser("run-suite", help="Run one configured model through run-osworld, finalize-run, score, and merge-report.")
+    suite.add_argument("--config", type=Path, default=REPO_ROOT / "configs" / "dev_10_models.example.json")
+    suite.add_argument("--model", required=True, help="Model name, agent_model, or slug from the suite config.")
+    suite.add_argument("--agent-backend", choices=["osworld", "agentv4"], default=None)
+    suite.add_argument("--agentv4-path", default=None)
+    suite.add_argument("--suite-name", default=None)
+    suite.add_argument("--max-steps", type=int, default=None)
+    suite.add_argument("--judge-model", default=None)
+    suite.add_argument("--judge-num-workers", type=int, default=None)
+    suite.add_argument("--api-base", default=None)
+    suite.add_argument("--env-file", type=Path, default=None)
+    suite.add_argument("--osworld-path", default=None)
+    suite.add_argument("--path-to-vm", default=None)
+    suite.add_argument("--python", default=None, help="Python executable for OSWorld; defaults to the current interpreter.")
+    suite.add_argument("--continue-on-runner-error", action=argparse.BooleanOptionalAction, default=False)
+    suite.add_argument("--dry-run", action="store_true")
+    suite.set_defaults(func=cmd_run_suite)
 
     return parser
 

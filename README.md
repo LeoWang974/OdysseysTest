@@ -100,7 +100,7 @@ python -m odysseys_eval finalize-run \
   --result-dir outputs/runs_dev_10_gpt55
 ```
 
-Create the fixed development subset used for local/remote baseline runs:
+Create the fixed development subset used for local baseline runs:
 
 ```bash
 python -m odysseys_eval prepare-dev-subset \
@@ -122,9 +122,9 @@ python -m odysseys_eval run-osworld \
   --max-steps 30
 ```
 
-On Linux servers, run long experiments inside `tmux` or `screen`. The local
-Windows Docker setup is useful for smoke tests, but full or multi-model
-experiments should run on a server with Docker and KVM acceleration.
+The current project policy is to run follow-up experiments on this local
+Windows machine. For long local runs, use a dedicated PowerShell or Windows
+Terminal tab and keep Docker Desktop running.
 
 Convert tasks to per-file OSWorld examples.
 
@@ -169,8 +169,8 @@ python -m odysseys_eval score \
 
 `score` enables the `ODYSSEYS_USE_CURL_OPENAI=1` Windows/local compatibility
 fallback by default for OpenAI-compatible endpoints. It avoids OpenSSL binding
-issues seen with some Python SDK imports. On a normal Linux server, pass
-`--no-use-curl-openai` if the standard SDK path is preferred.
+issues seen with some Python SDK imports. Pass `--no-use-curl-openai` only if
+the standard SDK path is known to be stable in the current local environment.
 
 Merge runner health/cost metrics with rubric scores:
 
@@ -186,6 +186,50 @@ python -m odysseys_eval merge-report \
 
 The first fixed local `dev_10` baseline is documented at
 [`docs/baselines/dev_10_gpt55_baseline.md`](docs/baselines/dev_10_gpt55_baseline.md).
+
+### Multi-model dev_10 convention
+
+All dev_10 model runs must use the same task ids, the same agent step budget,
+and the same judge model:
+
+- Task ids: `outputs/dev_10/selected_tasks.json`
+- OSWorld meta: `outputs/dev_10/test_all.json`
+- Agent `max_steps`: `30`
+- Judge model: `gpt-5.5`
+- Judge `max_steps`: `100`
+- Judge `num_workers`: `1` for local/tokenhub stability unless explicitly changed
+
+The configured test agent backend is now `agentv4`, using the local
+`agentv4-agent-browser-skill-framework/` directory and its `browser-gui` agent.
+Run `python -m odysseys_eval agentv4-doctor` before starting an AgentV4 suite.
+See [`docs/agentv4_integration.md`](docs/agentv4_integration.md) for the
+structure analysis and current readiness checks.
+
+Use the model matrix in [`configs/dev_10_models.example.json`](configs/dev_10_models.example.json).
+The fixed output naming convention is:
+
+```text
+outputs/runs_dev_10_<model_slug>/
+outputs/reports/dev_10_<model_slug>_runner_report.json
+outputs/scores/dev_10_<model_slug>_eval.json
+outputs/scores/dev_10_<model_slug>_eval.csv
+outputs/leaderboards/dev_10_<model_slug>_baseline.json
+outputs/leaderboards/dev_10_<model_slug>_baseline.csv
+```
+
+Run one configured model end-to-end:
+
+```bash
+python -m odysseys_eval run-suite \
+  --config configs/dev_10_models.example.json \
+  --model gpt-5.5 \
+  --env-file .env
+```
+
+For local runs, use `--dry-run` first to print the resolved paths and model
+settings without starting the browser/VM.
+`run-suite` starts a real OSWorld run; use `merge-report` instead when you only
+want to recombine existing runner and judge artifacts.
 
 We report two metrics per task. Averaged is the mean rubric score. Perfect is 1 if and only if every rubric is satisfied.
 

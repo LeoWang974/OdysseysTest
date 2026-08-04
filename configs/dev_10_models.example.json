@@ -1,0 +1,70 @@
+{
+  "suite_name": "dev_10",
+  "domain": "mind2web_chrome",
+  "prepared_dir": "outputs/dev_10",
+  "task_source_json": "outputs/dev_10/selected_tasks.json",
+  "agent_backend": "agentv4",
+  "max_steps": 30,
+  "api_base": "https://tokenhub.sensetime.com/v1",
+  "use_curl_openai": true,
+  "reports_dir": "outputs/reports",
+  "scores_dir": "outputs/scores",
+  "leaderboards_dir": "outputs/leaderboards",
+  "osworld": {
+    "provider_name": "docker",
+    "path_env": "OSWORLD_PATH",
+    "vm_path_env": "OSWORLD_VM_PATH",
+    "observation_type": "screenshot",
+    "headless": true,
+    "sleep_after_execution": 0.0
+  },
+  "agentv4": {
+    "path": "agentv4-agent-browser-skill-framework",
+    "agent_id": "browser-gui",
+    "runner_script": ".harness/scripts/run-online-mind2web-harness-batch.mjs",
+    "task_timeout_ms": 1800000,
+    "preopen_website": true,
+    "close_browsers_each_task": true
+  },
+  "judge": {
+    "model": "gpt-5.5",
+    "num_workers": 1,
+    "max_images": 0,
+    "max_steps": 100,
+    "include_incomplete": false,
+    "api_base": "https://tokenhub.sensetime.com/v1",
+    "use_curl_openai": true
+  },
+  "models": [
+    {
+      "name": "gpt-5.5",
+      "slug": "gpt55",
+      "agent_model": "gpt-5.5"
+    },
+    {
+      "name": "gpt-5.6-luna",
+      "slug": "gpt56luna",
+      "agent_model": "gpt-5.6-luna"
+    },
+    {
+      "name": "gpt-5.6-sol",
+      "slug": "gpt56sol",
+      "agent_model": "gpt-5.6-sol"
+    },
+    {
+      "name": "gpt-5.6-terra",
+      "slug": "gpt56terra",
+      "agent_model": "gpt-5.6-terra"
+    },
+    {
+      "name": "deepseek",
+      "slug": "deepseek",
+      "agent_model": "deepseek"
+    },
+    {
+      "name": "kimi",
+      "slug": "kimi",
+      "agent_model": "kimi"
+    }
+  ]
+}
