@@ -1,7 +1,18 @@
 {
   "task_source_json": "data/odysseys.json",
   "outputs_dir": "outputs",
+  "agent_backend": "agentv4",
+  "agentv4": {
+    "path": "agentv4-agent-browser-skill-framework",
+    "agent_id": "browser-gui",
+    "task_timeout_ms": 1800000,
+    "preopen_website": true,
+    "close_browsers_each_task": true,
+    "allow_insecure_tokenhub_tls": true,
+    "auto_patch_agentv4": true
+  },
   "osworld": {
+    "legacy_only": true,
     "path_env": "OSWORLD_PATH",
     "vm_path_env": "OSWORLD_VM_PATH",
     "provider_name": "docker",
@@ -35,7 +46,7 @@
   "judge": {
     "model": "gpt-5.5",
     "num_workers": 1,
-    "max_images": 0,
+    "max_images": 45,
     "max_steps": 100,
     "include_incomplete": false,
     "api_base": "https://tokenhub.sensetime.com/v1",

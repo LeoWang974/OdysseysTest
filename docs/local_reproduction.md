@@ -1,12 +1,13 @@
 # Local Reproduction Guide
 
 This fork keeps the upstream Odysseys dataset and official rubric judge, then
-adds `odysseys_eval` as a local orchestration layer for OSWorld runs.
+adds `odysseys_eval` as a local orchestration layer for AgentV4 browser-agent
+runs. OSWorld remains available only as a legacy comparison backend.
 
 The intended workflow is:
 
 1. Prepare a fixed task subset.
-2. Run OSWorld trajectories.
+2. Run AgentV4 trajectories.
 3. Generate a runner report.
 4. Score trajectories with the Odysseys rubric judge.
 5. Summarize or merge runner and judge metrics.
@@ -34,14 +35,10 @@ Create `.env` locally. Do not commit it.
 OPENAI_API_KEY=...
 OPENAI_BASE_URL=https://tokenhub.sensetime.com/v1
 OPENAI_API_BASE=https://tokenhub.sensetime.com/v1
-OSWORLD_PATH=D:\gitWorkSpace\OSWorld
-OSWORLD_VM_PATH=C:\path\to\Ubuntu.qcow2
 ```
 
-For OSWorld, keep the VM image outside Git. `run-osworld` reads
-`OSWORLD_VM_PATH` from `.env`; use `--path-to-vm` only when overriding it for a
-specific run.
-
+Optional legacy OSWorld runs can still set `OSWORLD_PATH` and
+`OSWORLD_VM_PATH`, but these are not required for the current AgentV4 pipeline.
 
 ## Doctor
 
@@ -69,13 +66,13 @@ python -m odysseys_eval prepare `
   --local-chrome-stability
 ```
 
-Run a smoke trajectory:
+Run a smoke trajectory with AgentV4:
 
 ```powershell
-python -m odysseys_eval run-osworld `
+python -m odysseys_eval run-agentv4 `
   --prepared-dir outputs\smoke_stable `
-  --result-dir outputs\runs_smoke_stable_gpt55 `
-  --model gpt-5.5 `
+  --result-dir outputs\agentv4_smoke_stable_gpt56luna `
+  --model gpt-5.6-luna `
   --max-steps 10
 ```
 
@@ -85,7 +82,6 @@ The runner writes:
 - `run_console.log`
 - `pyautogui/screenshot/<model>/<domain>/<task_id>/traj.jsonl`
 - screenshots
-- `summary/results.json`
 - runner report JSON/CSV when `--write-report` is enabled
 
 ## Fixed dev_10 Subset
@@ -123,29 +119,27 @@ hard   3add0c2ffff8e0b3cacedf2e895d213735702f62
 hard   fc98d55986ef93480fb659db44e070c04f93301a
 ```
 
-Run the baseline:
+Run the current AgentV4 baseline through the suite wrapper:
 
 ```powershell
-python -m odysseys_eval run-osworld `
-  --prepared-dir outputs\dev_10 `
-  --result-dir outputs\runs_dev_10_gpt55 `
-  --model gpt-5.5 `
-  --max-steps 30
+python -m odysseys_eval run-suite `
+  --config configs\dev_10_models.example.json `
+  --model gpt-5.6-luna `
+  --env-file .env `
+  --agent-backend agentv4
 ```
 
-The local Windows run completed 10/10 trajectories and consumed about 1.87M
-tokens over about 2h43m. Follow-up experiments are run on this local Windows
-machine; use a dedicated PowerShell or Windows Terminal tab for long runs and
-keep Docker Desktop running.
+Follow-up experiments are run on this local Windows machine; use a dedicated
+PowerShell or Windows Terminal tab for long runs.
 
-If the outer shell or Codex tool times out but OSWorld keeps running and lands
-artifacts, finalize the run from disk:
+If the outer shell or Codex tool times out but the runner lands artifacts,
+finalize the run from disk:
 
 ```powershell
 python -m odysseys_eval finalize-run `
   --prepared-dir outputs\dev_10 `
-  --result-dir outputs\runs_dev_10_gpt55 `
-  --report-output outputs\reports\dev_10_gpt55_runner_report.json
+  --result-dir outputs\runs_dev_10_gpt56luna `
+  --report-output outputs\reports\dev_10_gpt56luna_runner_report.json
 ```
 
 ## Runner Report
@@ -154,15 +148,17 @@ If needed, regenerate a runner report from an existing run directory:
 
 ```powershell
 python -m odysseys_eval smoke-report `
-  --runs-dir outputs\runs_dev_10_gpt55 `
-  --console-log outputs\runs_dev_10_gpt55\run_console.log `
-  --output outputs\reports\dev_10_gpt55_runner_report.json `
-  --csv-output outputs\reports\dev_10_gpt55_runner_report.csv
+  --runs-dir outputs\runs_dev_10_gpt56luna `
+  --console-log outputs\runs_dev_10_gpt56luna\run_console.log `
+  --output outputs\reports\dev_10_gpt56luna_runner_report.json `
+  --csv-output outputs\reports\dev_10_gpt56luna_runner_report.csv
 ```
 
 Runner report fields include:
 
-- OSWorld `task_success_rate`
+- `runner_backend`
+- `execution_success_rate`
+- AgentV4 `exit_code`, `steps`, and screenshot counts
 - raw step events and `max_step_num`
 - screenshots
 - prompt/completion/total tokens
@@ -170,6 +166,9 @@ Runner report fields include:
 - duration
 - trajectory errors
 - runtime and console error counters
+
+For AgentV4 runs, OSWorld Task SR is intentionally `null`. Task quality is
+measured by the Odysseys rubric judge.
 
 ## AgentV4 Runner
 
@@ -204,26 +203,29 @@ For OpenAI-compatible judging through tokenhub:
 
 ```powershell
 python -m odysseys_eval score `
-  --runs-dir outputs\runs_dev_10_gpt55\pyautogui\screenshot\gpt-5.5\mind2web_chrome `
+  --runs-dir outputs\runs_dev_10_gpt56luna\pyautogui\screenshot\gpt-5.6-luna\mind2web_chrome `
   --task-source-json outputs\dev_10\selected_tasks.json `
-  --output outputs\scores\dev_10_gpt55_eval.json `
-  --csv-output outputs\scores\dev_10_gpt55_eval.csv `
+  --output outputs\scores\dev_10_gpt56luna_eval.json `
+  --csv-output outputs\scores\dev_10_gpt56luna_eval.csv `
   --model gpt-5.5 `
   --num-workers 1 `
+  --max-images 45 `
   --api-base https://tokenhub.sensetime.com/v1 `
   --env-file .env
 ```
 
-`score` writes `outputs\scores\dev_10_gpt55_eval.manifest.json` by default and
+`score` writes a manifest next to the output JSON by default and
 enables the local curl fallback automatically. Pass `--no-use-curl-openai` only
 if the standard Python SDK path is stable in the current local environment.
+The image cap defaults to 45 and clamps unsafe values to avoid 50-image API
+limits.
 
 Summarize an existing score file:
 
 ```powershell
 python -m odysseys_eval summarize `
-  --eval-results outputs\scores\dev_10_gpt55_eval.json `
-  --csv-output outputs\scores\dev_10_gpt55_eval.csv
+  --eval-results outputs\scores\dev_10_gpt56luna_eval.json `
+  --csv-output outputs\scores\dev_10_gpt56luna_eval.csv
 ```
 
 Judge metrics include:
@@ -239,23 +241,22 @@ Merge the runner report and rubric score into a single model-comparison table:
 
 ```powershell
 python -m odysseys_eval merge-report `
-  --runner-report outputs\reports\dev_10_gpt55_runner_report.json `
-  --score-results outputs\scores\dev_10_gpt55_eval.json `
+  --runner-report outputs\reports\dev_10_gpt56luna_runner_report.json `
+  --score-results outputs\scores\dev_10_gpt56luna_eval.json `
   --task-source-json outputs\dev_10\selected_tasks.json `
-  --output outputs\leaderboards\dev_10_gpt55_baseline.json `
-  --csv-output outputs\leaderboards\dev_10_gpt55_baseline.csv `
-  --model gpt-5.5
+  --output outputs\leaderboards\dev_10_gpt56luna_baseline.json `
+  --csv-output outputs\leaderboards\dev_10_gpt56luna_baseline.csv `
+  --model gpt-5.6-luna
 ```
 
-The fixed local baseline is summarized in
-[`docs/baselines/dev_10_gpt55_baseline.md`](baselines/dev_10_gpt55_baseline.md).
+Legacy OSWorld baselines are kept under `docs/baselines/` only for comparison.
 
 ## Multi-model dev_10 Runs
 
 For model comparisons, keep the evaluation surface fixed:
 
 - Same task ids: `outputs\dev_10\selected_tasks.json`
-- Same OSWorld meta: `outputs\dev_10\test_all.json`
+- Same prepared task metadata: `outputs\dev_10\test_all.json`
 - Same agent step budget: `max_steps=30`
 - Same judge model: `gpt-5.5`
 - Same judge step budget: `max_steps=100`
@@ -274,7 +275,7 @@ analysis, Windows setup notes, and current readiness checks.
 
 The model matrix lives in
 [`configs/dev_10_models.example.json`](../configs/dev_10_models.example.json).
-It defines the shared subset, judge settings, OSWorld defaults, output
+It defines the shared subset, judge settings, AgentV4 defaults, output
 directories, and model slugs.
 
 Output naming convention:
@@ -309,19 +310,19 @@ python -m odysseys_eval run-suite `
 
 `run-suite` executes:
 
-1. `run-osworld`
+1. `run-agentv4`
 2. `finalize-run`
 3. `score`
 4. `merge-report`
 
 For local long runs, launch this command in a dedicated terminal. `run-suite`
-starts a real browser/VM run; use `merge-report` when you only want to recombine
+starts a real AgentV4 browser run; use `merge-report` when you only want to recombine
 existing runner and judge artifacts.
 
 ## Local Experiment Checklist
 
-1. Keep this repository and OSWorld on the local machine.
-2. Keep the VM image outside the Git repo and set `OSWORLD_VM_PATH`.
+1. Keep this repository and the AgentV4 framework on the local machine.
+2. Keep the AgentV4 framework directory ignored by Git.
 3. Keep API keys in local `.env`; never commit it.
 4. Run `python -m odysseys_eval doctor`.
 5. Run `python -m odysseys_eval agentv4-doctor` before AgentV4 runs.
@@ -331,12 +332,10 @@ existing runner and judge artifacts.
 
 ## Known Local Issues
 
-- Windows Docker provider has no KVM acceleration and is slow.
+- AgentV4 browser commands run through the Windows PowerShell tool and local
+  `agent-browser` binary.
 - Long `dev_10` runs can exceed local tool/terminal timeouts.
-- OSWorld recording stop sometimes emits 400/500 errors; trajectory artifacts
-  still land correctly.
 - Some websites trigger Google CAPTCHA / unusual traffic pages. Chrome
   certificate interstitials are handled by `--local-chrome-stability`.
 - Some local Windows Python SDK imports hit OpenSSL Applink issues. The
-  `ODYSSEYS_USE_CURL_OPENAI=1` fallback avoids this for the rubric judge, and
-  `OSWORLD_USE_CURL_OPENAI=1` is used for OSWorld agent calls.
+  `ODYSSEYS_USE_CURL_OPENAI=1` fallback avoids this for the rubric judge.

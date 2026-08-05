@@ -29,6 +29,14 @@ LOCAL_CHROME_STABILITY_ARGS = [
     "--test-type",
 ]
 DEFAULT_AGENTV4_PATH = REPO_ROOT / "agentv4-agent-browser-skill-framework"
+DEFAULT_JUDGE_MAX_IMAGES = 45
+OSWORLD_BROWSER_PROMPT_SUFFIX = (
+    "Local Odysseys browser stability notes: when Chrome is at about:blank or you need to navigate/search, "
+    "first use pyautogui.hotkey('ctrl', 'l'), then type the complete URL or search query with pyautogui.write(...), "
+    "then pyautogui.press('enter'). Avoid relying on the clipboard or pyperclip; this VM may not have xclip. "
+    "If a click or navigation visibly does nothing, do not repeat the same coordinates; use ctrl+l direct navigation "
+    "or a clearly different visible target."
+)
 
 
 def load_json(path: Path) -> Any:
@@ -301,10 +309,10 @@ def build_agentv4_env(
     env["OPENAI_API_BASE"] = api_base
     env.setdefault("npm_config_strict_ssl", "false")
     env.setdefault("PYTHONIOENCODING", "utf-8")
-    env.setdefault("AGENT_BROWSER_HEADED", "0")
-    env.setdefault("BROWSER_HEADLESS", "1")
-    env.setdefault("PLAYWRIGHT_HEADLESS", "1")
-    env.setdefault("AGENT_BROWSER_HEADLESS", "1")
+    env.setdefault("AGENT_BROWSER_HEADED", "1")
+    env.setdefault("BROWSER_HEADLESS", "0")
+    env.setdefault("PLAYWRIGHT_HEADLESS", "0")
+    env.setdefault("AGENT_BROWSER_HEADLESS", "0")
     if allow_insecure_tls:
         env["NODE_TLS_REJECT_UNAUTHORIZED"] = "0"
     return env
@@ -333,13 +341,27 @@ def update_agentv4_agent_model(agentv4_path: Path, agent_id: str, model: str, *,
     return updated != text
 
 
+def agentv4_browser_command_prefix(agentv4_path: Path) -> str:
+    win_bin = agentv4_path / "vendor" / "agent-browser" / "bin" / "agent-browser-win32-x64.exe"
+    if os.name == "nt" and win_bin.is_file():
+        return "vendor/agent-browser/bin/agent-browser-win32-x64.exe"
+    vendor = agentv4_path / "vendor" / "agent-browser" / "bin" / "agent-browser.js"
+    if os.name == "nt" and vendor.is_file():
+        return "node vendor/agent-browser/bin/agent-browser.js"
+    return ".harness/bin/agent-browser"
+
+
+def agentv4_browser_command_options() -> str:
+    return " --headed --ignore-https-errors" if os.name == "nt" else ""
+
+
 def ensure_agentv4_powershell_auto_screenshot(agentv4_path: Path) -> bool:
     runner_path = agentv4_path / "packages" / "core" / "src" / "application" / "runtime" / "AgentRunner.ts"
     if not runner_path.is_file():
         return False
     text = runner_path.read_text(encoding="utf-8")
-    if "execution.toolName !== 'PowerShell'" in text:
-        return False
+    updated = text
+    changed = False
     needle = "if (execution === undefined || execution.toolName !== 'Bash') return content"
     replacement = (
         "if (\n"
@@ -347,10 +369,396 @@ def ensure_agentv4_powershell_auto_screenshot(agentv4_path: Path) -> bool:
         "      (execution.toolName !== 'Bash' && execution.toolName !== 'PowerShell')\n"
         "    ) return content"
     )
-    if needle not in text:
+    if "execution.toolName !== 'PowerShell'" not in updated and needle in updated:
+        updated = updated.replace(needle, replacement, 1)
+        changed = True
+
+    bash_spawn = """    const child = childProcess.spawn('bash', ['-lc', command], {
+      cwd,
+      env: process.env,
+      timeout: timeoutMs,
+    })"""
+    cross_shell_spawn = """    const child = process.platform === 'win32'
+      ? childProcess.spawn(`${process.env.SystemRoot ?? 'C:\\\\Windows'}\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe`, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], {
+        cwd,
+        env: process.env,
+        timeout: timeoutMs,
+      })
+      : childProcess.spawn('bash', ['-lc', command], {
+        cwd,
+        env: process.env,
+        timeout: timeoutMs,
+      })"""
+    if "System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe" not in updated and bash_spawn in updated:
+        updated = updated.replace(bash_spawn, cross_shell_spawn, 1)
+        changed = True
+    old_powershell_spawn = "childProcess.spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command]"
+    new_powershell_spawn = "childProcess.spawn(`${process.env.SystemRoot ?? 'C:\\\\Windows'}\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe`, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command]"
+    if "System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe" not in updated and old_powershell_spawn in updated:
+        updated = updated.replace(old_powershell_spawn, new_powershell_spawn, 1)
+        changed = True
+
+    wrapper_cmd = """  const viewportCmd =
+    `.harness/bin/agent-browser set viewport ${AUTO_SCREENSHOT_VIEWPORT_WIDTH} ${AUTO_SCREENSHOT_VIEWPORT_HEIGHT} ${AUTO_SCREENSHOT_DEVICE_SCALE_FACTOR}`
+  const screenshotCmd = `.harness/bin/agent-browser screenshot ${shellQuote(requestedPath)}`"""
+    vendor_cmd = """  const agentBrowserCmd = process.platform === 'win32'
+    ? `& ${shellQuote(path.join(opts.cwd, 'vendor', 'agent-browser', 'bin', 'agent-browser-win32-x64.exe'))}`
+    : '.harness/bin/agent-browser'
+  const agentBrowserOptions = process.platform === 'win32'
+    ? ' --headed --ignore-https-errors'
+    : ''
+  const viewportCmd =
+    `${agentBrowserCmd} set viewport ${AUTO_SCREENSHOT_VIEWPORT_WIDTH} ${AUTO_SCREENSHOT_VIEWPORT_HEIGHT} ${AUTO_SCREENSHOT_DEVICE_SCALE_FACTOR}${agentBrowserOptions}`
+  const screenshotCmd = `${agentBrowserCmd} screenshot ${shellQuote(requestedPath)}${agentBrowserOptions}`"""
+    if "const agentBrowserCmd = process.platform === 'win32'" not in updated and wrapper_cmd in updated:
+        updated = updated.replace(wrapper_cmd, vendor_cmd, 1)
+        changed = True
+    old_agent_browser_cmd = "? `node ${shellQuote(path.join(opts.cwd, 'vendor', 'agent-browser', 'bin', 'agent-browser.js'))}`"
+    new_agent_browser_cmd = "? `& ${shellQuote(path.join(opts.cwd, 'vendor', 'agent-browser', 'bin', 'agent-browser-win32-x64.exe'))}`"
+    if old_agent_browser_cmd in updated:
+        updated = updated.replace(old_agent_browser_cmd, new_agent_browser_cmd, 1)
+        changed = True
+    old_wait_cmd = "'.harness/bin/agent-browser wait 250'"
+    new_wait_cmd = "`${agentBrowserCmd} wait 250${agentBrowserOptions}`"
+    if old_wait_cmd in updated:
+        updated = updated.replace(old_wait_cmd, new_wait_cmd)
+        changed = True
+    if "const agentBrowserOptions = process.platform === 'win32'" not in updated and "const agentBrowserCmd = process.platform === 'win32'" in updated:
+        updated = updated.replace(
+            "  const viewportCmd =\n    `${agentBrowserCmd} set viewport ${AUTO_SCREENSHOT_VIEWPORT_WIDTH} ${AUTO_SCREENSHOT_VIEWPORT_HEIGHT} ${AUTO_SCREENSHOT_DEVICE_SCALE_FACTOR}`\n  const screenshotCmd = `${agentBrowserCmd} screenshot ${shellQuote(requestedPath)}`",
+            "  const agentBrowserOptions = process.platform === 'win32'\n    ? ' --headed --ignore-https-errors'\n    : ''\n  const viewportCmd =\n    `${agentBrowserCmd} set viewport ${AUTO_SCREENSHOT_VIEWPORT_WIDTH} ${AUTO_SCREENSHOT_VIEWPORT_HEIGHT} ${AUTO_SCREENSHOT_DEVICE_SCALE_FACTOR}${agentBrowserOptions}`\n  const screenshotCmd = `${agentBrowserCmd} screenshot ${shellQuote(requestedPath)}${agentBrowserOptions}`",
+            1,
+        )
+        changed = True
+    if "`${agentBrowserCmd} wait 250`" in updated:
+        updated = updated.replace("`${agentBrowserCmd} wait 250`", "`${agentBrowserCmd} wait 250${agentBrowserOptions}`")
+        changed = True
+    old_executable_token = """function isAgentBrowserExecutableToken(token: string | undefined): boolean {
+  if (token === undefined) return false
+  if (token === 'agent-browser') return true
+  if (token.endsWith('/agent-browser')) return true
+  if (token.endsWith('/agent-browser-darwin-arm64')) return true
+  return false
+}"""
+    new_executable_token = """function isAgentBrowserExecutableToken(token: string | undefined): boolean {
+  if (token === undefined) return false
+  const normalized = token.replace(/\\\\/g, '/')
+  if (normalized === 'agent-browser') return true
+  if (normalized.endsWith('/agent-browser')) return true
+  if (normalized.endsWith('/agent-browser.js')) return true
+  if (normalized.endsWith('/agent-browser-win32-x64.exe')) return true
+  if (normalized.endsWith('/agent-browser-darwin-arm64')) return true
+  return false
+}"""
+    if "agent-browser-win32-x64.exe')) return true" not in updated and old_executable_token in updated:
+        updated = updated.replace(old_executable_token, new_executable_token, 1)
+        changed = True
+
+    old_run_shell_body = """  return new Promise((resolve, reject) => {
+    const child = process.platform === 'win32'
+      ? childProcess.spawn(`${process.env.SystemRoot ?? 'C:\\\\Windows'}\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe`, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], {
+        cwd,
+        env: process.env,
+        timeout: timeoutMs,
+      })
+      : childProcess.spawn('bash', ['-lc', command], {
+        cwd,
+        env: process.env,
+        timeout: timeoutMs,
+      })
+    let stdout = ''
+    let stderr = ''
+    child.stdout?.on('data', (d) => { stdout += String(d) })
+    child.stderr?.on('data', (d) => { stderr += String(d) })
+    signal.addEventListener('abort', () => child.kill(), { once: true })
+    child.on('close', (code) => resolve({ stdout, stderr, exitCode: code ?? 1 }))
+    child.on('error', reject)
+  })"""
+    new_run_shell_body = """  return new Promise((resolve, reject) => {
+    const child = process.platform === 'win32'
+      ? childProcess.spawn(`${process.env.SystemRoot ?? 'C:\\\\Windows'}\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe`, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], {
+        cwd,
+        env: process.env,
+      })
+      : childProcess.spawn('bash', ['-lc', command], {
+        cwd,
+        env: process.env,
+      })
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    const finish = (payload: { stdout: string; stderr: string; exitCode: number }) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      signal.removeEventListener('abort', onAbort)
+      resolve(payload)
+    }
+    const fail = (err: Error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      signal.removeEventListener('abort', onAbort)
+      reject(err)
+    }
+    const killChild = () => {
+      try { child.kill() } catch {}
+    }
+    const onAbort = () => {
+      stderr += '\\n[odysseys_eval] auto screenshot command aborted'
+      killChild()
+      finish({ stdout, stderr, exitCode: 130 })
+    }
+    const timer = setTimeout(() => {
+      stderr += `\\n[odysseys_eval] auto screenshot command timed out after ${timeoutMs}ms`
+      killChild()
+      finish({ stdout, stderr, exitCode: 124 })
+    }, timeoutMs)
+    child.stdout?.on('data', (d) => { stdout += String(d) })
+    child.stderr?.on('data', (d) => { stderr += String(d) })
+    signal.addEventListener('abort', onAbort, { once: true })
+    child.on('close', (code) => finish({ stdout, stderr, exitCode: code ?? 1 }))
+    child.on('error', fail)
+  })"""
+    if "[odysseys_eval] auto screenshot command timed out" not in updated and old_run_shell_body in updated:
+        updated = updated.replace(old_run_shell_body, new_run_shell_body, 1)
+        changed = True
+    fallback_anchor = "  return undefined\n}\n\nfunction readPngDimensions"
+    fallback_block = """  if (process.platform === 'win32') {
+    return await captureWindowsDesktopScreenshot({
+      childProcess,
+      cwd: opts.cwd,
+      fs,
+      path,
+      requestedPath,
+      signal: opts.signal,
+    })
+  }
+
+  return undefined
+}
+
+async function captureWindowsDesktopScreenshot(opts: {
+  childProcess: typeof import('node:child_process')
+  cwd: string
+  fs: typeof import('node:fs/promises')
+  path: typeof import('node:path')
+  requestedPath: string
+  signal: AbortSignal
+}): Promise<{ path: string; mediaType: string; base64: string } | undefined> {
+  const psScript = [
+    'Add-Type -AssemblyName System.Windows.Forms',
+    'Add-Type -AssemblyName System.Drawing',
+    `$out=${JSON.stringify(opts.requestedPath)}`,
+    '$bounds=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds',
+    '$source=New-Object System.Drawing.Bitmap $bounds.Width,$bounds.Height',
+    '$sourceGraphics=[System.Drawing.Graphics]::FromImage($source)',
+    '$sourceGraphics.CopyFromScreen($bounds.Location,[System.Drawing.Point]::Empty,$bounds.Size)',
+    `$target=New-Object System.Drawing.Bitmap ${AUTO_SCREENSHOT_VIEWPORT_WIDTH},${AUTO_SCREENSHOT_VIEWPORT_HEIGHT}`,
+    '$targetGraphics=[System.Drawing.Graphics]::FromImage($target)',
+    '$targetGraphics.DrawImage($source,0,0,$target.Width,$target.Height)',
+    '$target.Save($out,[System.Drawing.Imaging.ImageFormat]::Png)',
+    '$targetGraphics.Dispose()',
+    '$target.Dispose()',
+    '$sourceGraphics.Dispose()',
+    '$source.Dispose()',
+  ].join('; ')
+  const output = await runShellCommand(
+    opts.childProcess,
+    psScript,
+    opts.cwd,
+    opts.signal,
+    10_000,
+  )
+  if (output.exitCode !== 0) return undefined
+  try {
+    const data = await opts.fs.readFile(opts.requestedPath)
+    const dimensions = readPngDimensions(data)
+    if (
+      dimensions === undefined
+      || dimensions.width !== AUTO_SCREENSHOT_VIEWPORT_WIDTH
+      || dimensions.height !== AUTO_SCREENSHOT_VIEWPORT_HEIGHT
+    ) {
+      return undefined
+    }
+    const modelImage = await encodeScreenshotForModel({
+      childProcess: opts.childProcess,
+      cwd: opts.cwd,
+      fs: opts.fs,
+      path: opts.path,
+      signal: opts.signal,
+      sourcePath: opts.requestedPath,
+      data,
+    })
+    return { path: opts.requestedPath, ...modelImage }
+  } catch {
+    return undefined
+  }
+}
+
+function readPngDimensions"""
+    if "function captureWindowsDesktopScreenshot" not in updated and fallback_anchor in updated:
+        updated = updated.replace(fallback_anchor, fallback_block, 1)
+        changed = True
+    screenshot_path_anchor = "  if (saved?.[1]) return saved[1].trim()\n  const absolute = stdout.match(/(\\/[^\\n\\r]+?\\.png)/)"
+    screenshot_path_block = "  if (saved?.[1]) return saved[1].trim()\n  const windowsAbsolute = stdout.match(/[A-Za-z]:\\\\[^\\n\\r]+?\\.png/)\n  if (windowsAbsolute?.[0]) return windowsAbsolute[0].trim()\n  const absolute = stdout.match(/(\\/[^\\n\\r]+?\\.png)/)"
+    if "const windowsAbsolute = stdout.match" not in updated and screenshot_path_anchor in updated:
+        updated = updated.replace(screenshot_path_anchor, screenshot_path_block, 1)
+        changed = True
+
+    if changed:
+        runner_path.write_text(updated, encoding="utf-8")
+    return changed
+
+
+def ensure_agentv4_powershell_tool_windows_runner(agentv4_path: Path) -> bool:
+    tool_path = agentv4_path / "packages" / "core" / "src" / "application" / "builtins" / "tools" / "PowerShellTool.ts"
+    if not tool_path.is_file():
         return False
-    runner_path.write_text(text.replace(needle, replacement, 1), encoding="utf-8")
-    return True
+    text = tool_path.read_text(encoding="utf-8")
+    updated = text
+    changed = False
+    if "const fs = await import('node:fs')" not in updated:
+        updated = updated.replace(
+            "  const cp = await import('node:child_process')\n",
+            "  const cp = await import('node:child_process')\n  const fs = await import('node:fs')\n",
+            1,
+        )
+        changed = True
+    old_spawn = "const child = cp.spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', input.command], {"
+    new_spawn = "const child = cp.spawn(`${process.env.SystemRoot ?? 'C:\\\\Windows'}\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe`, ['-NoProfile', '-NonInteractive', '-Command', input.command], {"
+    if old_spawn in updated:
+        updated = updated.replace(old_spawn, new_spawn, 1)
+        changed = True
+    old_cwd = "      cwd: input.cwd ?? process.cwd?.(),"
+    new_cwd = "      cwd: input.cwd && fs.existsSync(input.cwd) ? input.cwd : process.cwd?.(),"
+    if old_cwd in updated:
+        updated = updated.replace(old_cwd, new_cwd, 1)
+        changed = True
+    old_runner_body = """    const child = cp.spawn(`${process.env.SystemRoot ?? 'C:\\\\Windows'}\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe`, ['-NoProfile', '-NonInteractive', '-Command', input.command], {
+      cwd: input.cwd && fs.existsSync(input.cwd) ? input.cwd : process.cwd?.(),
+      timeout: input.timeout ?? DEFAULT_TIMEOUT_MS,
+      env: process.env,
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout?.on('data', (d) => { stdout += String(d) })
+    child.stderr?.on('data', (d) => { stderr += String(d) })
+    input.signal?.addEventListener('abort', () => child.kill(), { once: true })
+    child.on('close', (code) => {
+      resolve({ stdout, stderr, exitCode: code ?? 1 })
+    })
+    child.on('error', reject)"""
+    new_runner_body = """    const requestedTimeoutMs = input.timeout ?? DEFAULT_TIMEOUT_MS
+    const timeoutMs = /agent-browser(?:\\.js|-win32-x64\\.exe|\\b)/.test(input.command)
+      ? Math.min(requestedTimeoutMs, 15_000)
+      : requestedTimeoutMs
+    const child = cp.spawn(`${process.env.SystemRoot ?? 'C:\\\\Windows'}\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe`, ['-NoProfile', '-NonInteractive', '-Command', input.command], {
+      cwd: input.cwd && fs.existsSync(input.cwd) ? input.cwd : process.cwd?.(),
+      env: process.env,
+    })
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    const finish = (payload: ShellOutput) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      input.signal?.removeEventListener('abort', onAbort)
+      resolve(payload)
+    }
+    const fail = (err: Error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      input.signal?.removeEventListener('abort', onAbort)
+      reject(err)
+    }
+    const killChild = () => {
+      try { child.kill() } catch {}
+    }
+    const onAbort = () => {
+      stderr += '\\n[odysseys_eval] PowerShell tool aborted'
+      killChild()
+      finish({ stdout, stderr, exitCode: 130 })
+    }
+    const timer = setTimeout(() => {
+      stderr += `\\n[odysseys_eval] PowerShell tool timed out after ${timeoutMs}ms`
+      killChild()
+      finish({ stdout, stderr, exitCode: 124 })
+    }, timeoutMs)
+    child.stdout?.on('data', (d) => { stdout += String(d) })
+    child.stderr?.on('data', (d) => { stderr += String(d) })
+    input.signal?.addEventListener('abort', onAbort, { once: true })
+    child.on('close', (code) => {
+      finish({ stdout, stderr, exitCode: code ?? 1 })
+    })
+    child.on('error', fail)"""
+    if "[odysseys_eval] PowerShell tool timed out" not in updated and old_runner_body in updated:
+        updated = updated.replace(old_runner_body, new_runner_body, 1)
+        changed = True
+    old_timeout_line = "    const timeoutMs = input.timeout ?? DEFAULT_TIMEOUT_MS\n    const child = cp.spawn"
+    new_timeout_line = (
+        "    const requestedTimeoutMs = input.timeout ?? DEFAULT_TIMEOUT_MS\n"
+        "    const timeoutMs = /agent-browser(?:\\.js|-win32-x64\\.exe|\\b)/.test(input.command)\n"
+        "      ? Math.min(requestedTimeoutMs, 15_000)\n"
+        "      : requestedTimeoutMs\n"
+        "    const child = cp.spawn"
+    )
+    if "const requestedTimeoutMs = input.timeout ?? DEFAULT_TIMEOUT_MS" not in updated and old_timeout_line in updated:
+        updated = updated.replace(old_timeout_line, new_timeout_line, 1)
+        changed = True
+    soft_timeout_anchor = """    if (result.stderr.length > this.maxOutputBytes) {
+      result.stderr = result.stderr.slice(0, this.maxOutputBytes) + '\\n...[truncated]'
+    }
+    return { output: result }"""
+    soft_timeout_block = """    if (result.stderr.length > this.maxOutputBytes) {
+      result.stderr = result.stderr.slice(0, this.maxOutputBytes) + '\\n...[truncated]'
+    }
+    if (/agent-browser(?:\\.js|-win32-x64\\.exe|\\b)/.test(input.command) && result.exitCode === 124) {
+      result.stderr += '\\n[odysseys_eval] agent-browser timed out after dispatch; treating as observable because the browser action may have taken effect. Inspect the attached screenshot before deciding the next action.'
+      result.exitCode = 0
+    }
+    return { output: result }"""
+    if "agent-browser timed out after dispatch" not in updated and soft_timeout_anchor in updated:
+        updated = updated.replace(soft_timeout_anchor, soft_timeout_block, 1)
+        changed = True
+    if changed:
+        tool_path.write_text(updated, encoding="utf-8")
+    return changed
+
+
+def ensure_agentv4_windows_browser_instructions(agentv4_path: Path, agent_id: str) -> bool:
+    if os.name != "nt":
+        return False
+    marker = "<!-- odysseys_eval_windows_agent_browser_override -->"
+    browser_command = agentv4_browser_command_prefix(agentv4_path)
+    note = (
+        f"\n\n{marker}\n"
+        "Windows local runner override:\n\n"
+        f"- Use PowerShell tool calls, not Bash tool calls, for browser actions in this Windows environment.\n"
+        f"- Use `{browser_command}` for all browser actions in this Windows environment.\n"
+        "- Do not call `.harness/bin/agent-browser`; it is a Unix bash wrapper without a Windows executable extension and can trigger the Windows \"open with\" dialog.\n"
+        "- Issue exactly one browser command per PowerShell tool call. Do not chain commands with `&&`, `;`, or pipes.\n"
+    )
+    changed = False
+    targets = [
+        agentv4_path / ".harness" / "agents" / f"{agent_id}.md",
+        agentv4_path / ".harness" / "skills" / "agent-browser" / "SKILL.md",
+    ]
+    for path in targets:
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        if marker in text:
+            updated = text.split(marker, 1)[0].rstrip() + note + "\n"
+            if updated != text:
+                path.write_text(updated, encoding="utf-8")
+                changed = True
+            continue
+        path.write_text(text.rstrip() + note + "\n", encoding="utf-8")
+        changed = True
+    return changed
 
 
 def prepare_agentv4_runtime(
@@ -375,6 +783,8 @@ def prepare_agentv4_runtime(
         "agent_model_updated": False,
         "agent_thinking_disabled": not model.lower().startswith("claude"),
         "powershell_auto_screenshot_patch_applied": False,
+        "powershell_tool_patch_applied": False,
+        "windows_browser_instruction_patch_applied": False,
     }
     if auto_patch:
         write_agentv4_settings(agentv4_path, model=model, api_base=api_base)
@@ -385,6 +795,8 @@ def prepare_agentv4_runtime(
             disable_thinking=bool(changes["agent_thinking_disabled"]),
         )
         changes["powershell_auto_screenshot_patch_applied"] = ensure_agentv4_powershell_auto_screenshot(agentv4_path)
+        changes["powershell_tool_patch_applied"] = ensure_agentv4_powershell_tool_windows_runner(agentv4_path)
+        changes["windows_browser_instruction_patch_applied"] = ensure_agentv4_windows_browser_instructions(agentv4_path, agent_id)
     return changes
 
 
@@ -397,12 +809,12 @@ def safe_file_part(value: str, limit: int = 120) -> str:
     return (cleaned or "item")[:limit]
 
 
-def build_agentv4_task_prompt(task: dict[str, Any], *, max_steps: int, preopen_website: bool) -> str:
+def build_agentv4_task_prompt(task: dict[str, Any], *, max_steps: int, preopen_website: bool, browser_command: str) -> str:
     task_id = task.get("task_id") or task.get("id") or "unknown"
     website = task.get("website") or task.get("url") or task.get("web") or "about:blank"
     confirmed_task = task.get("confirmed_task") or task.get("task") or task.get("annotation") or ""
     start_instruction = (
-        f"Start by opening the website URL with .harness/bin/agent-browser open {website}."
+        f"Start by opening the website URL with {browser_command} open {website}{agentv4_browser_command_options()}."
         if preopen_website
         else "Start from the website URL in the task."
     )
@@ -415,7 +827,12 @@ def build_agentv4_task_prompt(task: dict[str, Any], *, max_steps: int, preopen_w
         "Do not output point-only x,y coordinates for GUI target actions.",
         start_instruction,
         "Do not use read/snapshot/DOM/text extraction; rely on runtime screenshots after each browser action.",
-        "Execute GUI actions with bbox coordinates through .harness/bin/agent-browser.",
+        f"Execute GUI actions with bbox coordinates through {browser_command}; append `{agentv4_browser_command_options().strip()}` to every agent-browser command in this Windows run.",
+        "If Google or an initial page shows a blank white/black screenshot, do not immediately stop; use the next browser action to open a task-relevant direct site URL or search URL.",
+        "Do not add or override --session; the runner sets AGENT_BROWSER_SESSION separately for this task.",
+        "Use the PowerShell tool for browser commands in this Windows run, not the Bash tool.",
+        "If the loaded skill mentions .harness/bin/agent-browser, override that path for this local Windows run and use the command prefix above instead.",
+        "On Windows PowerShell, issue exactly one browser command per tool call; do not chain commands with &&, ;, or pipes, and do not pass a cwd for browser commands.",
         "When completed, answer concisely with the completed result, or report why completion was blocked.",
     ])
 
@@ -423,7 +840,14 @@ def build_agentv4_task_prompt(task: dict[str, Any], *, max_steps: int, preopen_w
 def run_agent_browser_close(agentv4_path: Path, env: dict[str, str]) -> None:
     vendor = agentv4_path / "vendor" / "agent-browser" / "bin" / "agent-browser.js"
     command = ["node", str(vendor), "close", "--all"] if vendor.is_file() else ["bash", "-lc", ".harness/bin/agent-browser close --all"]
-    run_capture_with_timeout(command, cwd=agentv4_path, env=env, timeout_seconds=30)
+    run_capture_with_timeout(command, cwd=agentv4_path, env=env, timeout_seconds=15)
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "agent-browser-win32-x64.exe"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
 
 
 def run_agentv4_cli_task(
@@ -445,7 +869,15 @@ def run_agentv4_cli_task(
     stdout_path = run_dir / "stdout.log"
     stderr_path = run_dir / "stderr.log"
     session_file.unlink(missing_ok=True)
-    prompt = build_agentv4_task_prompt(task, max_steps=max_steps, preopen_website=preopen_website)
+    agent_browser_session = safe_file_part(f"odysseys-{task_index:03d}-{task_id[:16]}", 80).lower()
+    task_env = env.copy()
+    task_env["AGENT_BROWSER_SESSION"] = agent_browser_session
+    prompt = build_agentv4_task_prompt(
+        task,
+        max_steps=max_steps,
+        preopen_website=preopen_website,
+        browser_command=agentv4_browser_command_prefix(agentv4_path),
+    )
     bun_args = [
         "npx",
         "--yes",
@@ -468,7 +900,7 @@ def run_agentv4_cli_task(
     exit_code, stdout, stderr, error = run_capture_with_timeout(
         command,
         cwd=agentv4_path,
-        env=env,
+        env=task_env,
         timeout_seconds=task_timeout_ms / 1000 if task_timeout_ms > 0 else None,
     )
     signal = "timeout" if exit_code == 124 else None
@@ -484,6 +916,7 @@ def run_agentv4_cli_task(
         "signal": signal,
         "error": error,
         "session_id": session_id,
+        "agent_browser_session": agent_browser_session,
         "started_at": started.isoformat(timespec="seconds").replace("+00:00", "Z"),
         "ended_at": ended.isoformat(timespec="seconds").replace("+00:00", "Z"),
         "duration_seconds": round((ended - started).total_seconds(), 3),
@@ -586,16 +1019,61 @@ def copy_agentv4_auto_screenshot(agentv4_path: Path, session_id: str | None, too
     return output_path.name
 
 
-def capture_agentv4_fallback_screenshot(agentv4_path: Path, output_path: Path, env: dict[str, str] | None) -> str | None:
-    vendor = agentv4_path / "vendor" / "agent-browser" / "bin" / "agent-browser.js"
-    if not vendor.is_file():
+def parse_agent_browser_screenshot_path(stdout: str) -> Path | None:
+    match = re.search(r"saved to\s+(.+?\.png)", stdout, re.IGNORECASE)
+    if not match:
+        match = re.search(r"([A-Za-z]:\\[^\r\n]+?\.png|/[^\r\n]+?\.png)", stdout)
+    if not match:
         return None
-    run_capture_with_timeout(
-        ["node", str(vendor), "screenshot", str(output_path)],
+    candidate = Path(match.group(1).strip().strip('"').strip("'"))
+    return candidate if candidate.is_file() else None
+
+
+def capture_agentv4_fallback_screenshot(agentv4_path: Path, output_path: Path, env: dict[str, str] | None) -> str | None:
+    vendor_js = agentv4_path / "vendor" / "agent-browser" / "bin" / "agent-browser.js"
+    vendor_exe = agentv4_path / "vendor" / "agent-browser" / "bin" / "agent-browser-win32-x64.exe"
+    if os.name == "nt" and vendor_exe.is_file():
+        command = [str(vendor_exe), "screenshot", str(output_path)]
+    elif vendor_js.is_file():
+        command = ["node", str(vendor_js), "screenshot", str(output_path)]
+    else:
+        return None
+    _, stdout, _, _ = run_capture_with_timeout(
+        command,
         cwd=agentv4_path,
         env=env,
         timeout_seconds=15,
     )
+    if not output_path.is_file():
+        actual_path = parse_agent_browser_screenshot_path(stdout)
+        if actual_path:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(actual_path, output_path)
+    if not output_path.is_file() and os.name == "nt":
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        ps_script = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "Add-Type -AssemblyName System.Drawing; "
+            "$bounds=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; "
+            "$bitmap=New-Object System.Drawing.Bitmap $bounds.Width,$bounds.Height; "
+            "$graphics=[System.Drawing.Graphics]::FromImage($bitmap); "
+            "$graphics.CopyFromScreen($bounds.Location,[System.Drawing.Point]::Empty,$bounds.Size); "
+            f"$bitmap.Save({json.dumps(str(output_path))},[System.Drawing.Imaging.ImageFormat]::Png); "
+            "$graphics.Dispose(); $bitmap.Dispose();"
+        )
+        run_capture_with_timeout(
+            [
+                os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                ps_script,
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+            timeout_seconds=10,
+        )
     return output_path.name if output_path.is_file() else None
 
 
@@ -873,6 +1351,9 @@ def cmd_score(args: argparse.Namespace) -> int:
     output = resolve_repo_path(args.output).resolve()
     runs_dir = resolve_repo_path(args.runs_dir).resolve()
     task_source_json = resolve_repo_path(args.task_source_json).resolve()
+    if args.max_images <= 0 or args.max_images > DEFAULT_JUDGE_MAX_IMAGES:
+        print(f"WARNING: clamping --max-images from {args.max_images} to {DEFAULT_JUDGE_MAX_IMAGES} to stay under common 50-image API limits.")
+        args.max_images = DEFAULT_JUDGE_MAX_IMAGES
     manifest_output = resolve_repo_path(args.manifest_output)
     if manifest_output is None:
         manifest_output = output.with_suffix(".manifest.json")
@@ -970,6 +1451,8 @@ def cmd_summarize(args: argparse.Namespace) -> int:
                         "perfect",
                         "num_screenshots_sent",
                         "error",
+                        "judge_errored_rubrics",
+                        "judge_error_messages",
                     ],
                 )
                 writer.writeheader()
@@ -981,6 +1464,8 @@ def cmd_summarize(args: argparse.Namespace) -> int:
                         "perfect": item.get("perfect"),
                         "num_screenshots_sent": item.get("num_screenshots_sent"),
                         "error": item.get("error", ""),
+                        "judge_errored_rubrics": item.get("judge_errored_rubrics", 0),
+                        "judge_error_messages": " | ".join(str(msg) for msg in item.get("judge_error_messages", []) or []),
                     })
             print(f"Wrote CSV: {args.csv_output}")
         except PermissionError as exc:
@@ -1128,6 +1613,8 @@ def cmd_run_osworld(args: argparse.Namespace) -> int:
     if args.use_curl_openai:
         env["OSWORLD_USE_CURL_OPENAI"] = "1"
     env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("OSWORLD_DISABLE_RECORDING", "1")
+    env.setdefault("OSWORLD_SYSTEM_PROMPT_SUFFIX", OSWORLD_BROWSER_PROMPT_SUFFIX)
     docker_bin = r"C:\Program Files\Docker\Docker\resources\bin"
     if docker_bin not in env.get("PATH", ""):
         env["PATH"] = env.get("PATH", "") + os.pathsep + docker_bin
@@ -1155,6 +1642,8 @@ def cmd_run_osworld(args: argparse.Namespace) -> int:
         "env_flags": {
             "OSWORLD_USE_CURL_OPENAI": env.get("OSWORLD_USE_CURL_OPENAI"),
             "PYTHONIOENCODING": env.get("PYTHONIOENCODING"),
+            "OSWORLD_DISABLE_RECORDING": env.get("OSWORLD_DISABLE_RECORDING"),
+            "OSWORLD_SYSTEM_PROMPT_SUFFIX": "set" if env.get("OSWORLD_SYSTEM_PROMPT_SUFFIX") else "unset",
         },
         "command": command,
         "console_log": str(console_log),
@@ -1432,8 +1921,31 @@ def extract_console_duration_seconds(text: str) -> float | None:
     return round((max(timestamps) - min(timestamps)).total_seconds(), 3)
 
 
+def parse_runtime_metadata(text: str) -> dict[str, str]:
+    metadata: dict[str, str] = {}
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key:
+            metadata[key] = value.strip()
+    return metadata
+
+
+def infer_runner_backend(runs_dir: Path, manifest: dict[str, Any]) -> str:
+    backend = str(manifest.get("agent_backend") or "").strip().lower()
+    if backend:
+        return backend
+    if (runs_dir / "agentv4_raw").is_dir() or (runs_dir / "agentv4_conversions.json").is_file():
+        return "agentv4"
+    return "osworld"
+
+
 def cmd_smoke_report(args: argparse.Namespace) -> int:
     runs_dir = args.runs_dir.resolve()
+    manifest = load_json(runs_dir / "run_manifest.json") if (runs_dir / "run_manifest.json").is_file() else {}
+    runner_backend = infer_runner_backend(runs_dir, manifest if isinstance(manifest, dict) else {})
     console_text = read_text_auto(args.console_log) if args.console_log and args.console_log.is_file() else ""
     console_usage = extract_usage(console_text)
     console_duration = extract_console_duration_seconds(console_text)
@@ -1457,19 +1969,39 @@ def cmd_smoke_report(args: argparse.Namespace) -> int:
         result_text = read_text_auto(task_dir / "result.txt").strip() if (task_dir / "result.txt").is_file() else ""
         screenshots = sorted(task_dir.glob("step_*.png"))
         usage = extract_usage(runtime_text)
+        runtime_meta = parse_runtime_metadata(runtime_text)
         summary = summary_by_task.get(task_id, {})
         score = summary.get("score")
-        if score is None and result_text:
+        if runner_backend == "osworld" and score is None and result_text:
             try:
                 score = float(result_text)
             except ValueError:
                 score = None
+        exit_code = None
+        if runtime_meta.get("exit_code") not in (None, ""):
+            try:
+                exit_code = int(str(runtime_meta.get("exit_code")))
+            except ValueError:
+                exit_code = None
+        runner_status = runtime_meta.get("status") or summary.get("status", "unknown")
+        execution_success = int(
+            bool(step_rows)
+            and bool(screenshots)
+            and not error_rows
+            and (exit_code in (None, 0))
+        )
+        task_sr = 1 if runner_backend == "osworld" and score == 1 else (None if runner_backend != "osworld" else 0)
 
         task_reports.append({
             "task_id": task_id,
             "domain": task_dir.parent.name,
-            "status": summary.get("status", "unknown"),
-            "task_sr": 1 if score == 1 else 0,
+            "runner_backend": runner_backend,
+            "status": runner_status,
+            "runner_status": runner_status,
+            "execution_success": execution_success,
+            "exit_code": exit_code,
+            "signal": runtime_meta.get("signal") or "",
+            "task_sr": task_sr,
             "score": score,
             "steps": len(step_rows),
             "max_step_num": max([row.get("step_num", 0) for row in step_rows], default=0),
@@ -1482,10 +2014,16 @@ def cmd_smoke_report(args: argparse.Namespace) -> int:
             "calls_with_usage": usage["calls_with_usage"],
         })
 
+    osworld_task_reports = [item for item in task_reports if item.get("runner_backend") == "osworld"]
+    osworld_sr_terms = [item["task_sr"] for item in osworld_task_reports if item.get("task_sr") is not None]
     aggregate = {
         "runs_dir": str(runs_dir),
+        "runner_backend": runner_backend,
         "tasks": len(task_reports),
-        "task_success_rate": round(sum(item["task_sr"] for item in task_reports) / len(task_reports), 4) if task_reports else 0,
+        "execution_success_rate": round(sum(item["execution_success"] for item in task_reports) / len(task_reports), 4) if task_reports else 0,
+        "task_success_rate": round(sum(osworld_sr_terms) / len(osworld_sr_terms), 4) if osworld_sr_terms else None,
+        "osworld_task_success_rate": round(sum(osworld_sr_terms) / len(osworld_sr_terms), 4) if osworld_sr_terms else None,
+        "agentv4_execution_success_rate": round(sum(item["execution_success"] for item in task_reports) / len(task_reports), 4) if runner_backend == "agentv4" and task_reports else None,
         "total_steps": sum(item["steps"] for item in task_reports),
         "total_screenshots": sum(item["screenshots"] for item in task_reports),
         "trajectory_errors": sum(item["trajectory_errors"] for item in task_reports),
@@ -1555,9 +2093,46 @@ def select_suite_model(config: dict[str, Any], model_name: str) -> dict[str, Any
     raise SystemExit(f"Model not found in suite config: {model_name}. Available: {available}")
 
 
+def rubric_judge_error(item: dict[str, Any]) -> str:
+    error = str(item.get("judge_error") or "").strip()
+    if error:
+        return error
+    reasoning = str(item.get("final_reasoning") or "").strip()
+    if reasoning.startswith("Error judging rubric"):
+        return reasoning
+    return ""
+
+
+def score_judge_error_stats(score: dict[str, Any]) -> tuple[int, list[str]]:
+    messages: list[str] = []
+    if score.get("error"):
+        messages.append(str(score.get("error")))
+    count = int(score.get("judge_errored_rubrics") or 0)
+    for item in score.get("rubric_results", []) or []:
+        if not isinstance(item, dict):
+            continue
+        message = rubric_judge_error(item)
+        if message:
+            if not score.get("judge_errored_rubrics"):
+                count += 1
+            if message not in messages:
+                messages.append(message)
+    for message in score.get("judge_error_messages", []) or []:
+        text = str(message).strip()
+        if text and text not in messages:
+            messages.append(text)
+    return count, messages
+
+
 def cmd_merge_report(args: argparse.Namespace) -> int:
-    runner_report = load_json(resolve_repo_path(args.runner_report).resolve())
+    runner_report_path = resolve_repo_path(args.runner_report).resolve()
+    runner_report = load_json(runner_report_path)
     score_results = load_json(resolve_repo_path(args.score_results).resolve())
+    runner_summary = runner_report.get("summary", {}) if isinstance(runner_report.get("summary", {}), dict) else {}
+    runner_backend = str(runner_summary.get("runner_backend") or "").strip().lower()
+    backend_hint = f"{runner_report_path} {runner_summary.get('runs_dir', '')}".lower()
+    if not runner_backend:
+        runner_backend = "agentv4" if "agentv4" in backend_hint else "osworld"
     task_source_json = resolve_repo_path(args.task_source_json)
     task_meta = task_metadata_by_id(task_source_json.resolve() if task_source_json else None)
     output = resolve_repo_path(args.output).resolve()
@@ -1567,13 +2142,18 @@ def cmd_merge_report(args: argparse.Namespace) -> int:
 
     runner_by_task = {str(item.get("task_id")): item for item in runner_report.get("tasks", []) if item.get("task_id")}
     score_by_task = {str(item.get("task_id")): item for item in score_results.get("tasks", []) if item.get("task_id")}
-    task_ids = sorted(set(runner_by_task) | set(score_by_task) | set(task_meta))
+    task_ids = sorted(set(runner_by_task) | set(score_by_task))
+    if not task_ids:
+        task_ids = sorted(set(task_meta))
 
     rows = []
     for task_id in task_ids:
         runner = runner_by_task.get(task_id, {})
         score = score_by_task.get(task_id, {})
         meta = task_meta.get(task_id, {})
+        judge_errored_rubrics, judge_error_messages = score_judge_error_stats(score)
+        rubric_scores = score.get("rubric_scores", {}) or {}
+        rubric_score_sum = sum(float(value or 0) for value in rubric_scores.values()) if isinstance(rubric_scores, dict) else 0.0
         steps = score.get("num_steps") or runner.get("steps") or 0
         rubric_avg = score.get("average_rubric_score")
         try:
@@ -1583,9 +2163,11 @@ def cmd_merge_report(args: argparse.Namespace) -> int:
         rows.append({
             "task_id": task_id,
             "model": args.model,
+            "runner_backend": runner.get("runner_backend") or runner_backend,
             "level": meta.get("level"),
             "reference_length": meta.get("reference_length"),
-            "num_rubrics": meta.get("num_rubrics") or len(score.get("rubric_scores", {}) or {}),
+            "num_rubrics": meta.get("num_rubrics") or len(rubric_scores),
+            "rubric_score_sum": rubric_score_sum,
             "rubric_avg": rubric_avg,
             "perfect": score.get("perfect"),
             "trajectory_efficiency": efficiency,
@@ -1594,9 +2176,14 @@ def cmd_merge_report(args: argparse.Namespace) -> int:
             "max_step_num": runner.get("max_step_num"),
             "screenshots": runner.get("screenshots"),
             "screenshots_sent": score.get("num_screenshots_sent"),
-            "osworld_status": runner.get("status"),
-            "osworld_score": runner.get("score"),
-            "osworld_task_sr": runner.get("task_sr"),
+            "runner_status": runner.get("runner_status") or runner.get("status"),
+            "execution_success": runner.get("execution_success"),
+            "exit_code": runner.get("exit_code"),
+            "runner_score": runner.get("score"),
+            "runner_task_sr": runner.get("task_sr"),
+            "osworld_status": runner.get("status") if (runner.get("runner_backend") or runner_backend) == "osworld" else None,
+            "osworld_score": runner.get("score") if (runner.get("runner_backend") or runner_backend) == "osworld" else None,
+            "osworld_task_sr": runner.get("task_sr") if (runner.get("runner_backend") or runner_backend) == "osworld" else None,
             "prompt_tokens": runner.get("prompt_tokens"),
             "completion_tokens": runner.get("completion_tokens"),
             "total_tokens": runner.get("total_tokens"),
@@ -1604,6 +2191,8 @@ def cmd_merge_report(args: argparse.Namespace) -> int:
             "trajectory_errors": runner.get("trajectory_errors"),
             "runtime_error_mentions": runner.get("runtime_error_mentions"),
             "judge_error": score.get("error", ""),
+            "judge_errored_rubrics": judge_errored_rubrics,
+            "judge_error_messages": " | ".join(judge_error_messages),
             "run_dir": score.get("run_dir"),
         })
 
@@ -1612,17 +2201,25 @@ def cmd_merge_report(args: argparse.Namespace) -> int:
     total_tokens = sum(int(row["total_tokens"] or 0) for row in rows)
     judge_total_steps = sum(int(row["judge_num_steps"] or 0) for row in rows)
     runner_total_steps = sum(int(row["runner_steps"] or 0) for row in rows)
+    total_rubrics = sum(int(row["num_rubrics"] or 0) for row in rows)
+    rubric_score_sum = sum(float(row["rubric_score_sum"] or 0) for row in rows)
+    execution_terms = [int(row["execution_success"]) for row in rows if row.get("execution_success") is not None]
+    is_osworld_backend = runner_backend == "osworld"
+    is_agentv4_backend = runner_backend == "agentv4"
     summary = {
         "model": args.model,
+        "runner_backend": runner_backend,
         "tasks": len(rows),
         "scored_tasks": len(scored_rows),
-        "total_rubrics": sum(int(row["num_rubrics"] or 0) for row in rows),
-        "average_rubric_score": mean([float(row["rubric_avg"]) for row in scored_rows]),
+        "total_rubrics": total_rubrics,
+        "average_rubric_score": round(rubric_score_sum / total_rubrics, 6) if total_rubrics else None,
         "perfect_tasks": perfect_count,
         "perfect_task_rate": round(perfect_count / len(scored_rows), 6) if scored_rows else None,
         "trajectory_efficiency": mean([float(row["trajectory_efficiency"]) for row in rows if row["trajectory_efficiency"] is not None]),
         "trajectory_efficiency_x100": mean([float(row["trajectory_efficiency"]) * 100 for row in rows if row["trajectory_efficiency"] is not None]),
-        "osworld_task_success_rate": runner_report.get("summary", {}).get("task_success_rate"),
+        "execution_success_rate": round(sum(execution_terms) / len(execution_terms), 6) if execution_terms else runner_summary.get("execution_success_rate"),
+        "agentv4_execution_success_rate": runner_summary.get("agentv4_execution_success_rate") if is_agentv4_backend else None,
+        "osworld_task_success_rate": runner_summary.get("osworld_task_success_rate") if is_osworld_backend else None,
         "total_steps": runner_total_steps or judge_total_steps,
         "runner_total_steps": runner_total_steps,
         "judge_total_steps": judge_total_steps,
@@ -1634,9 +2231,11 @@ def cmd_merge_report(args: argparse.Namespace) -> int:
         "calls_with_usage": sum(int(row["calls_with_usage"] or 0) for row in rows),
         "trajectory_errors": sum(int(row["trajectory_errors"] or 0) for row in rows),
         "runtime_error_mentions": sum(int(row["runtime_error_mentions"] or 0) for row in rows),
-        "judge_errored_tasks": sum(1 for row in rows if row.get("judge_error")),
+        "judge_errored_tasks": sum(1 for row in rows if row.get("judge_error") or int(row.get("judge_errored_rubrics") or 0) > 0),
+        "judge_errored_rubrics": sum(int(row["judge_errored_rubrics"] or 0) for row in rows),
+        "tasks_with_judge_errors": sum(1 for row in rows if int(row.get("judge_errored_rubrics") or 0) > 0),
         "runner_duration_seconds": runner_report.get("summary", {}).get("duration_seconds"),
-        "runner_report": str(resolve_repo_path(args.runner_report).resolve()),
+        "runner_report": str(runner_report_path),
         "score_results": str(resolve_repo_path(args.score_results).resolve()),
         "task_source_json": str(task_source_json.resolve()) if task_source_json else None,
     }
@@ -1645,12 +2244,17 @@ def cmd_merge_report(args: argparse.Namespace) -> int:
         level_rows = [row for row in rows if (row.get("level") or "unknown") == level]
         level_scored = [row for row in level_rows if row["rubric_avg"] is not None]
         level_perfect = sum(1 for row in level_scored if row.get("perfect") is True)
+        level_rubrics = sum(int(row["num_rubrics"] or 0) for row in level_rows)
+        level_score_sum = sum(float(row["rubric_score_sum"] or 0) for row in level_rows)
         by_level[level] = {
             "tasks": len(level_rows),
-            "average_rubric_score": mean([float(row["rubric_avg"]) for row in level_scored]),
+            "average_rubric_score": round(level_score_sum / level_rubrics, 6) if level_rubrics else None,
             "perfect_task_rate": round(level_perfect / len(level_scored), 6) if level_scored else None,
+            "execution_success_rate": round(sum(int(row["execution_success"]) for row in level_rows if row.get("execution_success") is not None) / len([row for row in level_rows if row.get("execution_success") is not None]), 6) if [row for row in level_rows if row.get("execution_success") is not None] else None,
             "average_steps": mean([float(row["judge_num_steps"] or row["runner_steps"]) for row in level_rows if row["judge_num_steps"] or row["runner_steps"]]),
             "total_tokens": sum(int(row["total_tokens"] or 0) for row in level_rows),
+            "judge_errored_rubrics": sum(int(row["judge_errored_rubrics"] or 0) for row in level_rows),
+            "tasks_with_judge_errors": sum(1 for row in level_rows if int(row.get("judge_errored_rubrics") or 0) > 0),
         }
     summary["by_level"] = by_level
 
@@ -1770,7 +2374,7 @@ def cmd_run_suite(args: argparse.Namespace) -> int:
             output=score_output,
             model=plan["judge_model"],
             num_workers=int(args.judge_num_workers or judge.get("num_workers", 1)),
-            max_images=int(judge.get("max_images", 0)),
+            max_images=int(judge.get("max_images", DEFAULT_JUDGE_MAX_IMAGES)),
             max_steps=int(judge.get("max_steps", 100)),
             include_incomplete=bool(judge.get("include_incomplete", False)),
             api_base=args.api_base or judge.get("api_base") or config.get("api_base"),
@@ -1838,7 +2442,7 @@ def cmd_run_suite(args: argparse.Namespace) -> int:
         output=score_output,
         model=plan["judge_model"],
         num_workers=int(args.judge_num_workers or judge.get("num_workers", 1)),
-        max_images=int(judge.get("max_images", 0)),
+        max_images=int(judge.get("max_images", DEFAULT_JUDGE_MAX_IMAGES)),
         max_steps=int(judge.get("max_steps", 100)),
         include_incomplete=bool(judge.get("include_incomplete", False)),
         api_base=args.api_base or judge.get("api_base") or config.get("api_base"),
@@ -1911,7 +2515,7 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument("--output", type=Path, default=REPO_ROOT / "outputs" / "scores" / "eval_results_full_traj_per_rubric.json")
     score.add_argument("--model", default="gemini-3.1-flash-lite-preview")
     score.add_argument("--num-workers", type=int, default=4)
-    score.add_argument("--max-images", type=int, default=0)
+    score.add_argument("--max-images", type=int, default=DEFAULT_JUDGE_MAX_IMAGES)
     score.add_argument("--max-steps", type=int, default=100)
     score.add_argument("--include-incomplete", action="store_true")
     score.add_argument("--api-base", default=None)

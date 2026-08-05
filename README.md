@@ -27,13 +27,16 @@ Difficulty is assigned by step count and domain spread. Easy tasks use at most 5
 
 ## Run
 
-We use the [OSWorld](https://github.com/xlang-ai/OSWorld) runner with Chrome in an Ubuntu VM, a 100-step budget, and maximum reasoning effort.
+The current local evaluation backend in this fork is AgentV4 `browser-gui`.
+OSWorld remains available as a legacy comparison backend, but AgentV4 results
+should be judged by Odysseys rubric score, perfect task rate, trajectory
+efficiency, and execution stability rather than OSWorld Task SR.
 
 ### Local orchestration in this fork
 
 This fork keeps the upstream Odysseys data and official scoring script, and adds
 a local orchestration layer in [`odysseys_eval/`](odysseys_eval/) for reproducible
-OSWorld runs, smoke reports, and rubric judging.
+AgentV4 runs, smoke reports, merge reports, and rubric judging.
 
 Install the lightweight local dependencies:
 
@@ -46,8 +49,6 @@ Create a local `.env` file outside version control. Required values are usually:
 ```text
 OPENAI_API_KEY=...
 OPENAI_BASE_URL=https://tokenhub.sensetime.com/v1
-OSWORLD_PATH=/path/to/OSWorld
-OSWORLD_VM_PATH=/path/to/Ubuntu.qcow2
 ```
 
 Do not commit API keys, VM images, run outputs, or `.env` files.
@@ -69,25 +70,25 @@ python -m odysseys_eval prepare \
   --local-chrome-stability
 ```
 
-`--local-chrome-stability` injects Chrome launch flags into generated OSWorld
-examples to bypass certificate interstitials in the Docker VM:
+`--local-chrome-stability` injects Chrome launch flags into generated prepared
+examples for browser stability:
 
 - `--ignore-certificate-errors`
 - `--ignore-ssl-errors`
 - `--allow-running-insecure-content`
 - `--test-type`
 
-Run OSWorld through the local wrapper. The wrapper writes `run_console.log`,
-`run_manifest.json`, and a runner report with steps, screenshots, token usage,
-duration, and error counters. The manifest records model, step budget, prepared
-subset, OSWorld path, VM path, start/end time, git commit/status, and environment
-provider, but never API keys.
+Run AgentV4 through the local wrapper. The wrapper writes `run_console.log`,
+`run_manifest.json`, and a runner report with backend, execution success, steps,
+screenshots, duration, and error counters. The manifest records model, step
+budget, prepared subset, AgentV4 path, start/end time, git commit/status, and
+environment provider, but never API keys.
 
 ```bash
-python -m odysseys_eval run-osworld \
+python -m odysseys_eval run-agentv4 \
   --prepared-dir outputs/smoke_stable \
-  --result-dir outputs/runs_smoke_stable_gpt55 \
-  --model gpt-5.5 \
+  --result-dir outputs/agentv4_smoke_stable_gpt56luna \
+  --model gpt-5.6-luna \
   --max-steps 10
 ```
 
@@ -97,7 +98,7 @@ manifest and regenerate the report from landed artifacts:
 ```bash
 python -m odysseys_eval finalize-run \
   --prepared-dir outputs/dev_10 \
-  --result-dir outputs/runs_dev_10_gpt55
+  --result-dir outputs/runs_dev_10_gpt56luna
 ```
 
 Create the fixed development subset used for local baseline runs:
@@ -112,19 +113,18 @@ python -m odysseys_eval prepare-dev-subset \
   --local-chrome-stability
 ```
 
-Run the development baseline:
+Run the development baseline through AgentV4:
 
 ```bash
-python -m odysseys_eval run-osworld \
-  --prepared-dir outputs/dev_10 \
-  --result-dir outputs/runs_dev_10_gpt55 \
-  --model gpt-5.5 \
-  --max-steps 30
+python -m odysseys_eval run-suite \
+  --config configs/dev_10_models.example.json \
+  --model gpt-5.6-luna \
+  --agent-backend agentv4
 ```
 
 The current project policy is to run follow-up experiments on this local
 Windows machine. For long local runs, use a dedicated PowerShell or Windows
-Terminal tab and keep Docker Desktop running.
+Terminal tab.
 
 Convert tasks to per-file OSWorld examples.
 
@@ -157,12 +157,13 @@ For this fork's wrapper, the same judge can be launched through:
 
 ```bash
 python -m odysseys_eval score \
-  --runs-dir outputs/runs_dev_10_gpt55/pyautogui/screenshot/gpt-5.5/mind2web_chrome \
+  --runs-dir outputs/runs_dev_10_gpt56luna/pyautogui/screenshot/gpt-5.6-luna/mind2web_chrome \
   --task-source-json outputs/dev_10/selected_tasks.json \
-  --output outputs/scores/dev_10_gpt55_eval.json \
-  --csv-output outputs/scores/dev_10_gpt55_eval.csv \
+  --output outputs/scores/dev_10_gpt56luna_eval.json \
+  --csv-output outputs/scores/dev_10_gpt56luna_eval.csv \
   --model gpt-5.5 \
   --num-workers 1 \
+  --max-images 45 \
   --api-base https://tokenhub.sensetime.com/v1 \
   --env-file .env
 ```
@@ -176,16 +177,16 @@ Merge runner health/cost metrics with rubric scores:
 
 ```bash
 python -m odysseys_eval merge-report \
-  --runner-report outputs/reports/dev_10_gpt55_runner_report.json \
-  --score-results outputs/scores/dev_10_gpt55_eval.json \
+  --runner-report outputs/reports/dev_10_gpt56luna_runner_report.json \
+  --score-results outputs/scores/dev_10_gpt56luna_eval.json \
   --task-source-json outputs/dev_10/selected_tasks.json \
-  --output outputs/leaderboards/dev_10_gpt55_baseline.json \
-  --csv-output outputs/leaderboards/dev_10_gpt55_baseline.csv \
-  --model gpt-5.5
+  --output outputs/leaderboards/dev_10_gpt56luna_baseline.json \
+  --csv-output outputs/leaderboards/dev_10_gpt56luna_baseline.csv \
+  --model gpt-5.6-luna
 ```
 
-The first fixed local `dev_10` baseline is documented at
-[`docs/baselines/dev_10_gpt55_baseline.md`](docs/baselines/dev_10_gpt55_baseline.md).
+Legacy OSWorld `dev_10` baselines are kept under `docs/baselines/` only for
+comparison.
 
 ### Multi-model dev_10 convention
 
@@ -193,7 +194,7 @@ All dev_10 model runs must use the same task ids, the same agent step budget,
 and the same judge model:
 
 - Task ids: `outputs/dev_10/selected_tasks.json`
-- OSWorld meta: `outputs/dev_10/test_all.json`
+- Prepared task metadata: `outputs/dev_10/test_all.json`
 - Agent `max_steps`: `30`
 - Judge model: `gpt-5.5`
 - Judge `max_steps`: `100`
@@ -227,8 +228,8 @@ python -m odysseys_eval run-suite \
 ```
 
 For local runs, use `--dry-run` first to print the resolved paths and model
-settings without starting the browser/VM.
-`run-suite` starts the configured backend (`osworld` or `agentv4`); use
+settings without starting the browser.
+`run-suite` starts the configured AgentV4 backend by default; use
 `merge-report` instead when you only want to recombine existing runner and judge
 artifacts.
 

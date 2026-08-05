@@ -1,7 +1,8 @@
-# dev_10 gpt-5.5 Baseline
+# Legacy OSWorld dev_10 gpt-5.5 Baseline
 
-This is the first local end-to-end Odysseys dev_10 baseline produced with the
-local `odysseys_eval` orchestration layer.
+This is a legacy OSWorld-backend baseline retained for comparison. Current and
+future local experiments use the AgentV4 `browser-gui` backend, so OSWorld Task
+SR in this document should not be used as the AgentV4 success metric.
 
 ## Setup
 

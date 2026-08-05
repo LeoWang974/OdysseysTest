@@ -22,7 +22,7 @@ The intended control path is:
 Odysseys task
   -> AgentV4 browser-gui agent
   -> agent-browser-gui skill
-  -> Bash(.harness/bin/agent-browser ...)
+  -> PowerShell(vendor/agent-browser/bin/agent-browser-win32-x64.exe ...)
   -> agent-browser native CLI
   -> Chrome screenshots/actions
 ```
@@ -68,7 +68,8 @@ Working pieces:
 - `agent-browser` itself can launch Chrome and take screenshots.
 - A `pnpm-workspace.yaml` was added so pnpm can install workspace dependencies.
 - `packages/sdk/src/sessions/` has been restored.
-- `browser-gui` can run through the AgentV4 CLI and call `.harness/bin/agent-browser`.
+- `browser-gui` can run through the AgentV4 CLI and call the local Windows
+  `agent-browser` binary without triggering the Windows "open with" dialog.
 - AgentV4 transcripts can be adapted into scorer-compatible `traj.jsonl`,
   `step_*.png`, and `result.txt` directories.
 - A 1-task `gpt-5.6-luna` smoke verified `run-agentv4 -> score -> merge-report`.
@@ -87,6 +88,8 @@ Local runtime constraints:
 - Windows AgentV4 exposes browser commands through the `PowerShell` tool, so
   the local runner auto-patches AgentV4's auto-screenshot gate to accept both
   `Bash` and `PowerShell`.
+- AgentV4 is the current default backend for local experiments. OSWorld remains
+  available only as a legacy comparison backend.
 
 Run a one-task AgentV4 smoke:
 

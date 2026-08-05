@@ -31,7 +31,8 @@ except ImportError:
     load_dotenv = None
 
 DEFAULT_MODEL = "gemini-3.1-flash-lite-preview"
-DEFAULT_MAX_IMAGES = 0  # Keep all images
+DEFAULT_MAX_IMAGES = 45
+MAX_SAFE_IMAGES = 45
 FINAL_JUDGMENT_MAX_COMPLETION_TOKENS = 8192
 
 FULL_TRAJ_JUDGMENT_SYSTEM = """You are an expert evaluator of web-navigation agent trajectories.
@@ -59,6 +60,31 @@ Status: "success" or "failure"
 def append_unique(items: list[str], value: str) -> None:
     if value and value not in items:
         items.append(value)
+
+
+def rubric_judge_error(item: dict[str, Any]) -> str:
+    error = str(item.get("judge_error") or "").strip()
+    if error:
+        return error
+    reasoning = str(item.get("final_reasoning") or "").strip()
+    if reasoning.startswith("Error judging rubric"):
+        return reasoning
+    return ""
+
+
+def result_has_judge_errors(result: dict[str, Any]) -> bool:
+    if result.get("error"):
+        return True
+    if int(result.get("judge_errored_rubrics") or 0) > 0:
+        return True
+    return any(rubric_judge_error(item) for item in result.get("rubric_results", []) if isinstance(item, dict))
+
+
+def normalize_max_images(value: int) -> int:
+    if value <= 0 or value > MAX_SAFE_IMAGES:
+        print(f"WARNING: clamping --max-images from {value} to {MAX_SAFE_IMAGES} to stay under common 50-image API limits.")
+        return MAX_SAFE_IMAGES
+    return value
 
 
 def make_client(args: argparse.Namespace) -> tuple[str, Any]:
@@ -285,7 +311,9 @@ async def evaluate_run(run_dir: Path, client: Any, backend: str, model: str, tas
             thoughts_match = re.search(r"Thoughts:\s*(.+?)(?:Status:|$)", result_text, re.DOTALL)
             success = bool(status_match and status_match.group(1).lower() == "success")
             reasoning = thoughts_match.group(1).strip() if thoughts_match else result_text.strip() or "Empty judge response."
+            judge_error = ""
         except Exception as exc:
+            judge_error = f"{type(exc).__name__}: {exc}"
             success, reasoning = False, f"Error judging rubric {rubric.get('id', '?')}: {exc}"
         rubric_results.append({
             "rubric_id": rubric.get("id", "?"),
@@ -294,9 +322,13 @@ async def evaluate_run(run_dir: Path, client: Any, backend: str, model: str, tas
             "score": 1 if success else 0,
             "success": success,
             "final_reasoning": reasoning,
+            "judge_error": judge_error,
         })
 
     rubric_scores = {item["rubric_id"]: item["score"] for item in rubric_results}
+    judge_error_messages = []
+    for item in rubric_results:
+        append_unique(judge_error_messages, rubric_judge_error(item))
     average = sum(rubric_scores.values()) / len(rubric_scores) if rubric_scores else 0.0
     return {
         "run_dir": str(run_dir),
@@ -308,6 +340,8 @@ async def evaluate_run(run_dir: Path, client: Any, backend: str, model: str, tas
         "rubric_results": rubric_results,
         "average_rubric_score": round(average, 4),
         "perfect": bool(rubric_scores) and all(score == 1 for score in rubric_scores.values()),
+        "judge_errored_rubrics": len(judge_error_messages),
+        "judge_error_messages": judge_error_messages,
     }
 
 
@@ -374,7 +408,11 @@ async def main_async(args: argparse.Namespace) -> None:
         existing = {
             str(Path(item["run_dir"])): item
             for item in json.loads(output_path.read_text(encoding="utf-8")).get("tasks", [])
-            if isinstance(item, dict) and not item.get("error") and isinstance(item.get("run_dir"), str) and isinstance(item.get("rubric_scores"), dict) and item["rubric_scores"]
+            if isinstance(item, dict)
+            and not result_has_judge_errors(item)
+            and isinstance(item.get("run_dir"), str)
+            and isinstance(item.get("rubric_scores"), dict)
+            and item["rubric_scores"]
         }
     except Exception:
         existing = {}
@@ -405,6 +443,13 @@ async def main_async(args: argparse.Namespace) -> None:
     results = [results_by_key.get(str(run_dir)) or existing.get(str(run_dir)) for run_dir in run_dirs]
     results = [result for result in results if result is not None]
     all_scores = [score for result in results for score in (result.get("rubric_scores") or {}).values()]
+    judge_errored_rubrics = sum(
+        int(result.get("judge_errored_rubrics") or 0)
+        if "judge_errored_rubrics" in result
+        else sum(1 for item in result.get("rubric_results", []) if isinstance(item, dict) and rubric_judge_error(item))
+        for result in results
+    )
+    tasks_with_judge_errors = sum(1 for result in results if result_has_judge_errors(result))
     # Trajectory Efficiency = (1/N) Σ s_i / n_i, where s_i is the per-task average rubric score
     # (in [0,1]) and n_i is num_steps. Tasks with no recorded steps are skipped.
     eff_terms = [r["average_rubric_score"] / r["num_steps"]
@@ -421,16 +466,24 @@ async def main_async(args: argparse.Namespace) -> None:
         "trajectory_efficiency": round(traj_eff, 6),
         "trajectory_efficiency_x100": round(traj_eff * 100, 4),
         "errored_tasks": sum(1 for result in results if result.get("error")),
+        "judge_errored_rubrics": judge_errored_rubrics,
+        "tasks_with_judge_errors": tasks_with_judge_errors,
     }
     by_level = {}
     for result in results:
         level = task_index[result["task_id"]]["level"]
-        stats = by_level.setdefault(level, {"total_tasks": 0, "total_rubrics": 0, "score_sum": 0, "perfect_tasks": 0, "eff_sum": 0.0, "eff_n": 0})
+        stats = by_level.setdefault(level, {"total_tasks": 0, "total_rubrics": 0, "score_sum": 0, "perfect_tasks": 0, "eff_sum": 0.0, "eff_n": 0, "judge_errored_rubrics": 0, "tasks_with_judge_errors": 0})
         scores = list(result["rubric_scores"].values())
         stats["total_tasks"] += 1
         stats["total_rubrics"] += len(scores)
         stats["score_sum"] += sum(scores)
         stats["perfect_tasks"] += int(bool(result.get("perfect")))
+        stats["judge_errored_rubrics"] += (
+            int(result.get("judge_errored_rubrics") or 0)
+            if "judge_errored_rubrics" in result
+            else sum(1 for item in result.get("rubric_results", []) if isinstance(item, dict) and rubric_judge_error(item))
+        )
+        stats["tasks_with_judge_errors"] += int(result_has_judge_errors(result))
         n_steps = result.get("num_steps")
         avg_score = result.get("average_rubric_score")
         if isinstance(n_steps, int) and n_steps > 0 and isinstance(avg_score, (int, float)):
@@ -446,6 +499,8 @@ async def main_async(args: argparse.Namespace) -> None:
                 "perfect_task_rate": round(stats["perfect_tasks"] / stats["total_tasks"], 4) if stats["total_tasks"] else 0.0,
                 "trajectory_efficiency": round(stats["eff_sum"] / stats["eff_n"], 6) if stats["eff_n"] else 0.0,
                 "trajectory_efficiency_x100": round((stats["eff_sum"] / stats["eff_n"]) * 100, 4) if stats["eff_n"] else 0.0,
+                "judge_errored_rubrics": stats["judge_errored_rubrics"],
+                "tasks_with_judge_errors": stats["tasks_with_judge_errors"],
             }
             for level, stats in by_level.items()
         }
@@ -470,7 +525,7 @@ def main() -> None:
     parser.add_argument("--api-base", default=None)
     parser.add_argument("--gemini-api-key", default=None)
     parser.add_argument("--env-file", type=Path, default=None, help="Path to a .env file to load before reading API keys (default: ./.env if present).")
-    parser.add_argument("--max-images", type=int, default=DEFAULT_MAX_IMAGES, help="Keep the last N screenshots per trajectory; 0 = unlimited.")
+    parser.add_argument("--max-images", type=int, default=DEFAULT_MAX_IMAGES, help="Keep the last N screenshots per trajectory. Values <=0 or >45 are clamped to 45 to stay under common 50-image API limits.")
     parser.add_argument("--max-steps", type=int, default=0, help="Only consider trajectory rows whose step_num <= this value; default/0 = unlimited.")
     parser.add_argument("--num-workers", type=int, default=1, help="Max concurrent runs.")
     parser.add_argument("--include-incomplete", action="store_true", default=False, help="Include runs without a numeric result.txt.")
@@ -488,6 +543,8 @@ def main() -> None:
         args.api_key = os.getenv("OPENAI_API_KEY")
     if args.gemini_api_key is None:
         args.gemini_api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+
+    args.max_images = normalize_max_images(args.max_images)
 
     asyncio.run(main_async(args))
 
